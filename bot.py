@@ -32,6 +32,10 @@ OWNER_IDS = {
 CHANNEL_USERNAME = "@BET_Tek"
 CHANNEL_URL = "https://t.me/BET_Tek"
 
+# آیدی/یوزرنیم گپ اجباری را اینجا وارد کن
+GROUP_USERNAME = "@BET_Tek"
+GROUP_URL = "https://t.me/BET_Tek"
+
 DB_FILE = "bot.db"
 
 MIN_GAME_BET = Decimal("0.1")
@@ -534,15 +538,25 @@ async def check_membership(
 
     try:
 
-        member = await context.bot.get_chat_member(
+        channel_member = await context.bot.get_chat_member(
             CHANNEL_USERNAME,
             user_id
         )
 
-        return member.status in (
+        group_member = await context.bot.get_chat_member(
+            GROUP_USERNAME,
+            user_id
+        )
+
+        valid_statuses = (
             "member",
             "administrator",
             "creator",
+        )
+
+        return (
+            channel_member.status in valid_statuses
+            and group_member.status in valid_statuses
         )
 
     except Exception as e:
@@ -576,6 +590,12 @@ async def require_membership(
             InlineKeyboardButton(
                 "📢 عضویت در BET_Tek",
                 url=CHANNEL_URL
+            )
+        ],
+        [
+            InlineKeyboardButton(
+                "👥 عضویت در گپ",
+                url=GROUP_URL
             )
         ],
         [
@@ -715,10 +735,8 @@ async def start(
 
     ensure_user(user)
 
-    # اگر مدیر هنگام کار با پنل /start بزند، حالت قبلی پنل
-    # نباید باعث بلعیده شدن دستور /start شود.
-    context.user_data.pop("admin_operation", None)
-    context.user_data.pop("admin_waiting", None)
+    if not await require_membership(update, context):
+        return
 
     # -----------------------------
     # REFERRAL
@@ -3855,35 +3873,27 @@ async def text_handler(
             return
 
     # ========================================================
-    # 2. ADMIN BALANCE — SINGLE HANDLER
-    # هر دو عملیات فقط از یک مسیر پردازش می‌شوند.
+    # 2. ADMIN CHARGE
     # ========================================================
 
     if is_owner(user.id):
 
-        # فقط یک مسیر برای هر دو دستور؛ از دو هندلر جدا استفاده نمی‌شود.
-        match_balance = re.fullmatch(
-            r"(شارژ|کسر)\s+([0-9]+(?:\.[0-9]+)?)",
+        match_charge = re.match(
+            r"^شارژ\s+([0-9]+(?:\.[0-9]+)?)$",
             text
         )
 
-        if match_balance:
-
-            operation = (
-                "charge"
-                if match_balance.group(1) == "شارژ"
-                else "remove"
-            )
+        if match_charge:
 
             amount = parse_amount(
-                match_balance.group(2)
+                match_charge.group(1)
             )
 
             if amount is None:
 
                 await message.reply_text(
                     "❌ مبلغ صحیح نیست.\n"
-                    "مثال: شارژ 100 یا کسر 100"
+                    "مثال: شارژ 100"
                 )
 
                 return
@@ -3891,7 +3901,42 @@ async def text_handler(
             await admin_change_by_reply(
                 update,
                 context,
-                operation,
+                "charge",
+                amount
+            )
+
+            return
+
+    # ========================================================
+    # 3. ADMIN REMOVE
+    # ========================================================
+
+    if is_owner(user.id):
+
+        match_remove = re.match(
+            r"^کسر\s+([0-9]+(?:\.[0-9]+)?)$",
+            text
+        )
+
+        if match_remove:
+
+            amount = parse_amount(
+                match_remove.group(1)
+            )
+
+            if amount is None:
+
+                await message.reply_text(
+                    "❌ مبلغ صحیح نیست.\n"
+                    "مثال: کسر 100"
+                )
+
+                return
+
+            await admin_change_by_reply(
+                update,
+                context,
+                "remove",
                 amount
             )
 
@@ -4195,8 +4240,7 @@ def main():
     application.add_handler(
         CommandHandler(
             "start",
-            start,
-            block=True
+            start
         )
     )
 
