@@ -715,6 +715,11 @@ async def start(
 
     ensure_user(user)
 
+    # اگر مدیر هنگام کار با پنل /start بزند، حالت قبلی پنل
+    # نباید باعث بلعیده شدن دستور /start شود.
+    context.user_data.pop("admin_operation", None)
+    context.user_data.pop("admin_waiting", None)
+
     # -----------------------------
     # REFERRAL
     # -----------------------------
@@ -3856,8 +3861,9 @@ async def text_handler(
 
     if is_owner(user.id):
 
-        match_balance = re.match(
-            r"^(شارژ|کسر)\s+([0-9]+(?:\.[0-9]+)?)$",
+        # فقط یک مسیر برای هر دو دستور؛ از دو هندلر جدا استفاده نمی‌شود.
+        match_balance = re.fullmatch(
+            r"(شارژ|کسر)\s+([0-9]+(?:\.[0-9]+)?)",
             text
         )
 
@@ -4189,7 +4195,8 @@ def main():
     application.add_handler(
         CommandHandler(
             "start",
-            start
+            start,
+            block=True
         )
     )
 
