@@ -28,85 +28,12 @@ OWNER_IDS = {
     8552447077,
     7221112088,
 }
-# ================= FORCE JOIN =================
 
 CHANNEL_USERNAME = "@BET_Tek"
 CHANNEL_URL = "https://t.me/BET_Tek"
 
-# یوزرنیم گپ را اینجا بگذار
-GROUP_USERNAME = "@BET_Tek"
-GROUP_URL = "https://t.me/BET_Tek"
-
-
-async def check_membership(user_id, context):
-    try:
-        channel_member = await context.bot.get_chat_member(
-            CHANNEL_USERNAME,
-            user_id
-        )
-
-        group_member = await context.bot.get_chat_member(
-            GROUP_USERNAME,
-            user_id
-        )
-
-        channel_ok = channel_member.status in (
-            "member",
-            "administrator",
-            "creator"
-        )
-
-        group_ok = group_member.status in (
-            "member",
-            "administrator",
-            "creator"
-        )
-
-        return channel_ok and group_ok
-
-    except Exception as e:
-        logger.warning("Membership error: %s", e)
-        return False
-
-
-async def require_membership(update, context):
-    user = update.effective_user
-
-    if not user:
-        return False
-
-    if await check_membership(user.id, context):
-        return True
-
-    keyboard = InlineKeyboardMarkup([
-        [
-            InlineKeyboardButton(
-                "📢 عضویت در کانال",
-                url=CHANNEL_URL
-            )
-        ],
-        [
-            InlineKeyboardButton(
-                "👥 عضویت در گپ",
-                url=GROUP_URL
-            )
-        ],
-        [
-            InlineKeyboardButton(
-                "✅ بررسی عضویت",
-                callback_data="check_membership"
-            )
-        ]
-    ])
-
-    await safe_send_message(
-        context.bot,
-        update.effective_chat.id,
-        "🔒 برای استفاده از ربات ابتدا باید در کانال و گپ عضو شوید.",
-        reply_markup=keyboard
-    )
-
-    return False
+GROUP_USERNAME = "@SAP_Tek1"
+GROUP_URL = "https://t.me/SAP_Tek1"
     
 DB_FILE = "bot.db"
 
