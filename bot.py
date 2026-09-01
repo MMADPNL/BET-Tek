@@ -30,8 +30,8 @@ OWNER_IDS = {
     7221112088,
 }
 
-CHANNEL_USERNAME = "@BET_Tek"
-CHANNEL_URL = "https://t.me/BET_Tek"
+FORCE_JOIN_CHANNEL = "@BET_Tek"
+FORCE_JOIN_LINK = "https://t.me/BET_Tek"
 
 DB_FILE = "bot.db"
 
