@@ -26,6 +26,7 @@ BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 
 OWNER_IDS = {
     8552447077,
+    7966359658,
     7221112088,
 }
 
@@ -4388,3 +4389,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
