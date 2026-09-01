@@ -33,8 +33,8 @@ CHANNEL_USERNAME = "@BET_Tek"
 CHANNEL_URL = "https://t.me/BET_Tek"
 
 # آیدی/یوزرنیم گپ اجباری را اینجا وارد کن
-GROUP_USERNAME = "@BET_Tek"
-GROUP_URL = "https://t.me/BET_Tek"
+GROUP_USERNAME = "@YOUR_GROUP"
+GROUP_URL = "https://t.me/YOUR_GROUP"
 
 DB_FILE = "bot.db"
 
@@ -2452,10 +2452,12 @@ async def bot_game_callback(
 
                 return
 
+            # بازی با ربات فقط ۱ پرتاب دارد تا مرحله نتیجه همیشه کامل شود.
             db.execute("""
                 UPDATE games
                 SET opponent_id = -1,
                     mode = 'bot',
+                    count = 1,
                     status = 'creator_turn',
                     creator_rolls = 0,
                     opponent_rolls = 0,
