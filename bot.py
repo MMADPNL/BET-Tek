@@ -33,7 +33,7 @@ CHANNEL_USERNAME = "@BET_Tek"
 CHANNEL_URL = "https://t.me/BET_Tek"
 
 # آیدی/یوزرنیم گپ اجباری را اینجا وارد کن
-GROUP_USERNAME = "@YOUR_GROUP"
+GROUP_USERNAME = "@BET_Tek"
 GROUP_URL = "https://t.me/YOUR_GROUP"
 
 DB_FILE = "bot.db"
