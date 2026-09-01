@@ -26,12 +26,14 @@ BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 
 OWNER_IDS = {
     8552447077,
-    7966359658,
     7221112088,
 }
 
 FORCE_JOIN_CHANNEL = "@BET_Tek"
 FORCE_JOIN_LINK = "https://t.me/BET_Tek"
+
+GAME_GROUP_USERNAME = "@BET_Tek"
+GAME_GROUP_LINK = "https://t.me/BET_Tek"
 
 DB_FILE = "bot.db"
 
