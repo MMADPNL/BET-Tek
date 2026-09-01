@@ -34,8 +34,8 @@ CHANNEL_USERNAME = "@BET_Tek"
 CHANNEL_URL = "https://t.me/BET_Tek"
 
 # یوزرنیم گپ را اینجا بگذار
-GROUP_USERNAME = "@YOUR_GROUP"
-GROUP_URL = "https://t.me/YOUR_GROUP"
+GROUP_USERNAME = "@BET_Tek"
+GROUP_URL = "https://t.me/BET_Tek"
 
 
 async def check_membership(user_id, context):
