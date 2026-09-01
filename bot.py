@@ -28,14 +28,86 @@ OWNER_IDS = {
     8552447077,
     7221112088,
 }
+# ================= FORCE JOIN =================
 
 CHANNEL_USERNAME = "@BET_Tek"
 CHANNEL_URL = "https://t.me/BET_Tek"
 
-# آیدی/یوزرنیم گپ اجباری را اینجا وارد کن
-GROUP_USERNAME = "@BET_Tek"
+# یوزرنیم گپ را اینجا بگذار
+GROUP_USERNAME = "@YOUR_GROUP"
 GROUP_URL = "https://t.me/YOUR_GROUP"
 
+
+async def check_membership(user_id, context):
+    try:
+        channel_member = await context.bot.get_chat_member(
+            CHANNEL_USERNAME,
+            user_id
+        )
+
+        group_member = await context.bot.get_chat_member(
+            GROUP_USERNAME,
+            user_id
+        )
+
+        channel_ok = channel_member.status in (
+            "member",
+            "administrator",
+            "creator"
+        )
+
+        group_ok = group_member.status in (
+            "member",
+            "administrator",
+            "creator"
+        )
+
+        return channel_ok and group_ok
+
+    except Exception as e:
+        logger.warning("Membership error: %s", e)
+        return False
+
+
+async def require_membership(update, context):
+    user = update.effective_user
+
+    if not user:
+        return False
+
+    if await check_membership(user.id, context):
+        return True
+
+    keyboard = InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton(
+                "📢 عضویت در کانال",
+                url=CHANNEL_URL
+            )
+        ],
+        [
+            InlineKeyboardButton(
+                "👥 عضویت در گپ",
+                url=GROUP_URL
+            )
+        ],
+        [
+            InlineKeyboardButton(
+                "✅ بررسی عضویت",
+                callback_data="check_membership"
+            )
+        ]
+    ])
+
+    await safe_send_message(
+        context.bot,
+        update.effective_chat.id,
+        "🔒 برای استفاده از ربات ابتدا باید در کانال و گپ عضو شوید.",
+        reply_markup=keyboard
+    )
+
+    return False
+    
 DB_FILE = "bot.db"
 
 MIN_GAME_BET = Decimal("0.1")
@@ -486,26 +558,43 @@ async def safe_send_dice(
     chat_id,
     emoji
 ):
-    # برای تعداد زیاد پرتاب، خطای موقت تلگرام نباید کل بازی را خراب کند.
-    for attempt in range(8):
+
+    for attempt in range(3):
+
         try:
+
             return await bot.send_dice(
                 chat_id=chat_id,
                 emoji=emoji
             )
 
         except (TimedOut, NetworkError) as e:
-            logger.warning("Dice network error (attempt %s): %s", attempt + 1, e)
-            await asyncio.sleep(min(2 + attempt, 6))
+
+            logger.warning(
+                "Dice network error: %s",
+                e
+            )
+
+            if attempt < 2:
+                await asyncio.sleep(2)
 
         except TelegramError as e:
-            # خطاهای موقت API/Rate limit را دوباره امتحان می‌کنیم.
-            logger.warning("Dice Telegram error (attempt %s): %s", attempt + 1, e)
-            await asyncio.sleep(min(2 + attempt, 8))
+
+            logger.error(
+                "Dice Telegram error: %s",
+                e
+            )
+
+            return None
 
         except Exception as e:
-            logger.exception("Dice error (attempt %s): %s", attempt + 1, e)
-            await asyncio.sleep(1)
+
+            logger.exception(
+                "Dice error: %s",
+                e
+            )
+
+            return None
 
     return None
 
@@ -521,25 +610,15 @@ async def check_membership(
 
     try:
 
-        channel_member = await context.bot.get_chat_member(
+        member = await context.bot.get_chat_member(
             CHANNEL_USERNAME,
             user_id
         )
 
-        group_member = await context.bot.get_chat_member(
-            GROUP_USERNAME,
-            user_id
-        )
-
-        valid_statuses = (
+        return member.status in (
             "member",
             "administrator",
             "creator",
-        )
-
-        return (
-            channel_member.status in valid_statuses
-            and group_member.status in valid_statuses
         )
 
     except Exception as e:
@@ -573,12 +652,6 @@ async def require_membership(
             InlineKeyboardButton(
                 "📢 عضویت در BET_Tek",
                 url=CHANNEL_URL
-            )
-        ],
-        [
-            InlineKeyboardButton(
-                "👥 عضویت در گپ",
-                url=GROUP_URL
             )
         ],
         [
@@ -717,9 +790,6 @@ async def start(
         return
 
     ensure_user(user)
-
-    if not await require_membership(update, context):
-        return
 
     # -----------------------------
     # REFERRAL
@@ -2452,12 +2522,29 @@ async def bot_game_callback(
 
                 return
 
-            # بازی با ربات فقط ۱ پرتاب دارد تا مرحله نتیجه همیشه کامل شود.
+            # بازی با ربات فقط با تعداد ۱ مجاز است.
+
+            # اگر تعداد بیشتر از ۱ باشد، اصلاً وارد بازی نمی‌شود.
+
+            if int(game["count"]) != 1:
+
+                db.rollback()
+
+                await query.answer(
+
+                    "🤖 حداکثر تعداد بازی با ربات ۱ است.",
+
+                    show_alert=True
+
+                )
+
+                return
+
+
             db.execute("""
                 UPDATE games
                 SET opponent_id = -1,
                     mode = 'bot',
-                    count = 1,
                     status = 'creator_turn',
                     creator_rolls = 0,
                     opponent_rolls = 0,
@@ -3063,26 +3150,14 @@ async def bot_roll_game(
             ]
         )
 
-        # اگر یک پرتاب موقتاً ناموفق شد، بازی را Reset نمی‌کنیم؛
-        # چند بار دیگر تلاش می‌کنیم تا تعداد کامل پرتاب‌ها ثبت شود.
         if not msg:
-            logger.error("Bot dice failed for game %s", game_id)
-            for retry in range(5):
-                await asyncio.sleep(2 + retry)
-                msg = await safe_send_dice(
-                    context.bot,
-                    game["chat_id"],
-                    GAME_EMOJI[game["game_type"]]
-                )
-                if msg:
-                    break
 
-        if not msg:
             await reset_game_internal(
                 context,
                 game_id,
-                reason="bot_roll_failed_after_retries"
+                reason="bot_roll_failed"
             )
+
             return None
 
         try:
@@ -3095,7 +3170,7 @@ async def bot_roll_game(
 
             pass
 
-        await asyncio.sleep(1.1)
+        await asyncio.sleep(0.8)
 
     with closing(get_db()) as db:
 
@@ -4408,3 +4483,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
