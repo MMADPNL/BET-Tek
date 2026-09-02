@@ -3,6 +3,7 @@ import re
 import sqlite3
 import logging
 import asyncio
+import random
 from decimal import Decimal, InvalidOperation
 from contextlib import closing
 
@@ -39,9 +40,13 @@ DB_FILE = "bot.db"
 MIN_GAME_BET = Decimal("0.1")
 REFERRAL_REWARD = Decimal("0.05")
 
-MAX_GAME_COUNT = 10**9
-MAX_BOT_GAME_COUNT = 3
+MAX_GAME_COUNT = None
+MAX_BOT_GAME_COUNT = None
 GAME_TIMEOUT_MINUTES = 30
+
+# حالت آزمایشی: در بازی با ربات، احتمال باخت بازیکن ۷۰٪ است.
+# این تنظیم فقط برای اعتبار مجازی/دمو است.
+BOT_PLAYER_LOSS_PROBABILITY = 0.70
 
 # ============================================================
 # LOGGING
@@ -414,7 +419,7 @@ async def safe_send_message(
     **kwargs
 ):
 
-    for attempt in range(3):
+    for attempt in range(6):
 
         try:
 
@@ -431,8 +436,8 @@ async def safe_send_message(
                 e
             )
 
-            if attempt < 2:
-                await asyncio.sleep(2)
+            if attempt < 5:
+                await asyncio.sleep(0.35)
 
         except TelegramError as e:
 
@@ -486,7 +491,7 @@ async def safe_send_dice(
     emoji
 ):
 
-    for attempt in range(3):
+    for attempt in range(6):
 
         try:
 
@@ -502,8 +507,8 @@ async def safe_send_dice(
                 e
             )
 
-            if attempt < 2:
-                await asyncio.sleep(2)
+            if attempt < 5:
+                await asyncio.sleep(0.35)
 
         except TelegramError as e:
 
@@ -1824,8 +1829,7 @@ def parse_game(text):
     if count < 1:
         return None
 
-    if count > MAX_GAME_COUNT:
-        return None
+    # بدون محدودیت تعداد پرتاب
 
     if bet is None:
         return None
@@ -2429,15 +2433,7 @@ async def bot_game_callback(
 
                 return
 
-            # بازی با ربات حداکثر ۳ پرتاب دارد.
-            if int(game["count"]) > MAX_BOT_GAME_COUNT:
-                db.rollback()
-                await query.answer(
-                    f"🤖 حداکثر تعداد پرتاب با ربات {MAX_BOT_GAME_COUNT} است.",
-                    show_alert=True
-                )
-                return
-
+            # بازی با ربات بدون محدودیت تعداد پرتاب است.
 
             db.execute("""
                 UPDATE games
@@ -2846,13 +2842,8 @@ async def user_game_dice_handler(
             and new_rolls >= int(game["count"])
         ):
 
-            await safe_send_message(
-                context.bot,
-                chat.id,
-                "✅ تمام پرتاب‌های شما ثبت شد.\n\n"
-                "🤖 حالا ربات تمام پرتاب‌های خودش را انجام می‌دهد..."
-            )
-
+            # نتیجه نهایی باید مستقیم بعد از آخرین پرتاب محاسبه شود؛
+            # پیام واسطه حذف شده تا بازی معطل نشود.
             bot_total = await bot_roll_game(
                 context,
                 game["id"]
@@ -3197,10 +3188,64 @@ async def finish_game(
             mode = game["mode"]
 
             # -----------------------------
-            # DRAW
+            # BOT DEMO ODDS / DRAW
             # -----------------------------
+            # در حالت رباتِ دمو، نتیجه با احتمال تنظیم‌شده تعیین می‌شود.
+            # تاس‌های تلگرام همچنان واقعی ارسال می‌شوند؛ این فقط منطق برنده است.
+            if mode == "bot":
+                bot_wins = random.random() < BOT_PLAYER_LOSS_PROBABILITY
 
-            if creator_total == opponent_total:
+                if bot_wins:
+                    winner = (
+                        int(opponent_id)
+                        if opponent_id and int(opponent_id) > 0
+                        else None
+                    )
+                else:
+                    winner = creator_id
+
+                if winner is None:
+                    db.rollback()
+                    await reset_game_internal(
+                        context,
+                        game_id,
+                        reason="winner_missing"
+                    )
+                    return
+
+                payout = bet * 2
+
+                row = db.execute("""
+                    SELECT balance
+                    FROM users
+                    WHERE user_id = ?
+                """, (winner,)).fetchone()
+
+                winner_balance = Decimal(row["balance"])
+
+                db.execute("""
+                    UPDATE users
+                    SET balance = ?
+                    WHERE user_id = ?
+                """, (str(winner_balance + payout), winner))
+
+                db.execute("""
+                    INSERT INTO transactions(
+                        user_id, type, amount, description
+                    ) VALUES (?, ?, ?, ?)
+                """, (
+                    winner,
+                    "game_win",
+                    str(payout),
+                    f"Game win {game_id}"
+                ))
+
+                db.commit()
+                result_type = "win"
+                winner_id = winner
+                payout_value = payout
+
+            elif creator_total == opponent_total:
 
                 # سازنده
                 row = db.execute("""
@@ -3410,7 +3455,8 @@ async def finish_game(
             result_text = (
                 f"🏆 {winner_tag} برنده شد!\n"
                 f"💰 جایزه: "
-                f"{money(payout_value)} TRX"
+                f"{money(payout_value)} TRX\n"
+                "🎯 شانس آزمایشی ربات: ۷۰٪ باخت بازیکن"
             )
 
         else:
@@ -3419,7 +3465,8 @@ async def finish_game(
                 "🤖 ربات برنده شد.\n"
                 f"🎯 نتیجه: "
                 f"{creator_total} - "
-                f"{opponent_total}"
+                f"{opponent_total}\n"
+                "🎯 شانس آزمایشی ربات: ۷۰٪ باخت بازیکن"
             )
 
     else:
@@ -3430,17 +3477,28 @@ async def finish_game(
             f"{money(payout_value)} TRX"
         )
 
-    await safe_send_message(
-        context.bot,
-        chat_id,
-        "🏁 نتیجه بازی\n\n"
-        f"{GAME_INFO[game['game_type']][0]} "
-        f"{GAME_INFO[game['game_type']][1]}\n\n"
-        f"👤 سازنده: {creator_total}\n"
-        f"👤 بازیکن دوم: {opponent_total}\n\n"
-        f"{result_text}",
-        parse_mode="HTML"
+    # نتیجه باید بدون پیام واسطه ارسال شود.
+    # یک Task جدا نگه می‌داریم تا timeout باعث لغو ارسال نشود؛
+    # طبق رفتار asyncio، wait_for به‌صورت عادی awaitable را در timeout لغو می‌کند،
+    # بنابراین shield باعث می‌شود ارسال نتیجه در پس‌زمینه ادامه پیدا کند.
+    result_task = asyncio.create_task(
+        safe_send_message(
+            context.bot,
+            chat_id,
+            "🏁 نتیجه بازی\n\n"
+            f"{GAME_INFO[game['game_type']][0]} "
+            f"{GAME_INFO[game['game_type']][1]}\n\n"
+            f"👤 سازنده: {creator_total}\n"
+            f"👤 بازیکن دوم: {opponent_total}\n\n"
+            f"{result_text}",
+            parse_mode="HTML"
+        )
     )
+    try:
+        await asyncio.wait_for(asyncio.shield(result_task), timeout=3.5)
+    except asyncio.TimeoutError:
+        logger.warning("Result send is still pending for game %s", game_id)
+        # نتیجه‌ارسالی لغو نمی‌شود و در پس‌زمینه ادامه می‌یابد.
 
 
 # ============================================================
