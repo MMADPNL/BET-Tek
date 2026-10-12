@@ -399,7 +399,7 @@ async def safe_send_dice(bot, chat_id, emoji):
 
 
 # ============================================================
-# MEMBERSHIP
+# MEMBERSHIP (FORCED JOIN)
 # ============================================================
 
 async def check_membership(user_id, context):
@@ -420,28 +420,58 @@ async def check_membership(user_id, context):
         return False
 
 
-async def require_membership(update, context):
-    user = update.effective_user
-    if not user:
-        return False
-    if await check_membership(user.id, context):
-        return True
-
-    keyboard = InlineKeyboardMarkup([
+def join_keyboard():
+    return InlineKeyboardMarkup([
         [InlineKeyboardButton("📢 عضویت در کانال BET_1XZX", url=CHANNEL_URL)],
         [InlineKeyboardButton("💬 عضویت در گپ GAP_BAZIN1", url=GROUP_URL)],
-        [InlineKeyboardButton("✅ بررسی عضویت", callback_data="check_membership")]
+        [InlineKeyboardButton("✅ بررسی عضویت", callback_data="check_membership")],
     ])
+
+
+async def send_join_required(update, context):
+    text = (
+        "🔒 <b>برای استفاده از ربات، ابتدا عضو شوید</b>\n\n"
+        f"📢 کانال: {CHANNEL_USERNAME}\n"
+        f"💬 گپ: {GROUP_USERNAME}\n\n"
+        "پس از عضویت، روی دکمه «✅ بررسی عضویت» بزنید."
+    )
+    keyboard = join_keyboard()
 
     if update.message:
         await safe_send_message(
             context.bot,
             update.effective_chat.id,
-            "🔒 برای بازی باید عضو هر دو مورد باشید:\n"
-            "📢 کانال: BET_1XZX\n"
-            "💬 گپ: GAP_BAZIN1",
+            text,
+            parse_mode="HTML",
             reply_markup=keyboard
         )
+    elif update.callback_query:
+        try:
+            await update.callback_query.edit_message_text(
+                text, parse_mode="HTML", reply_markup=keyboard
+            )
+        except Exception:
+            try:
+                await context.bot.send_message(
+                    chat_id=update.callback_query.message.chat_id,
+                    text=text,
+                    parse_mode="HTML",
+                    reply_markup=keyboard
+                )
+            except Exception:
+                pass
+
+
+async def require_membership(update, context):
+    user = update.effective_user
+    if not user:
+        return False
+    if is_owner(user.id):
+        return True
+    if await check_membership(user.id, context):
+        return True
+
+    await send_join_required(update, context)
     return False
 
 
@@ -452,15 +482,22 @@ async def membership_callback(update, context):
     except Exception:
         pass
 
-    if await check_membership(query.from_user.id, context):
+    user = query.from_user
+
+    if await check_membership(user.id, context):
         try:
-            await query.edit_message_text("✅ عضویت شما تأیید شد.")
+            await query.edit_message_text(
+                "✅ <b>عضویت شما تأیید شد.</b>\n\n"
+                "حالا می‌تونید از ربات استفاده کنید.\n"
+                "دستور /start رو بفرستید تا منو باز بشه.",
+                parse_mode="HTML"
+            )
         except Exception:
             pass
     else:
         try:
             await query.answer(
-                "❌ هنوز عضو کانال و گپ نیستید.",
+                "❌ هنوز عضو کانال و گپ نیستید!",
                 show_alert=True
             )
         except Exception:
@@ -595,6 +632,12 @@ async def start(update, context):
                                 )
                             except Exception:
                                 logger.exception("Referral reward failed")
+
+    # ✅ جوین اجباری (مالک معاف)
+    if not is_owner(user.id):
+        if not await check_membership(user.id, context):
+            await send_join_required(update, context)
+            return
 
     await update.message.reply_text(
         "🤖 BET_BT\n\n"
@@ -872,7 +915,7 @@ async def transfer(update, context, amount):
 
 
 # ============================================================
-# TRANSFER BY ID (حتی اگه طرف ربات رو استارت نکرده)
+# TRANSFER BY ID
 # ============================================================
 
 async def transfer_by_id(update, context, amount, target_id):
@@ -1697,11 +1740,18 @@ async def admin_callback(update, context):
 
 async def user_callback(update, context):
     query = update.callback_query
+    user = query.from_user
 
     try:
         await query.answer()
     except Exception:
         pass
+
+    # ✅ جوین اجباری (مالک معاف)
+    if not is_owner(user.id):
+        if not await check_membership(user.id, context):
+            await send_join_required(update, context)
+            return
 
     if query.data == "user_balance":
         await show_balance(update, context)
@@ -2497,7 +2547,7 @@ async def bot_roll_game(context, game_id):
 
 
 # ============================================================
-# FINISH GAME — نتیجه در گپ بدون کیبورد + کیبورد در PV
+# FINISH GAME
 # ============================================================
 
 async def finish_game(context, game_id):
@@ -2650,10 +2700,6 @@ async def finish_game(context, game_id):
             logger.exception("Finish game failed")
             return
 
-    # =============================
-    # ارسال نتیجه در گپ (بدون کیبورد)
-    # =============================
-
     chat_id = game["chat_id"]
     emoji, name = GAME_INFO[game["game_type"]]
 
@@ -2664,7 +2710,6 @@ async def finish_game(context, game_id):
     else:
         opponent_tag = user_tag(int(opponent_id)) if opponent_id else "?"
 
-    # --- مساوی ---
     if result_type in ("bot_draw", "two_draw"):
         await safe_send_message(
             context.bot,
@@ -2698,7 +2743,6 @@ async def finish_game(context, game_id):
                 )
         return
 
-    # --- ربات برد ---
     if result_type == "bot_bot_win":
         await safe_send_message(
             context.bot,
@@ -2719,7 +2763,6 @@ async def finish_game(context, game_id):
         )
         return
 
-    # --- بازیکن برد مقابل ربات ---
     if result_type == "bot_user_win":
         await safe_send_message(
             context.bot,
@@ -2740,7 +2783,6 @@ async def finish_game(context, game_id):
         )
         return
 
-    # --- دوستان ---
     winner_tag = user_tag(winner_id)
     loser_tag = user_tag(loser_id) if loser_id else "?"
 
@@ -3003,6 +3045,12 @@ async def text_handler(update, context):
 
     ensure_user(user)
 
+    # ✅ جوین اجباری (مالک معاف)
+    if not is_owner(user.id):
+        if not await check_membership(user.id, context):
+            await send_join_required(update, context)
+            return
+
     raw_text = message.text.strip()
     text = normalize_digits(raw_text).strip()
 
@@ -3112,8 +3160,6 @@ async def text_handler(update, context):
     # TRANSFER
     # ========================================================
     if text.startswith("انتقال"):
-        # حالت ۱: انتقال با ریپلای (فقط مبلغ)
-        # حالت ۲: انتقال با آیدی عددی (مبلغ + آیدی)
         match_reply = re.match(
             r"^انتقال\s+([0-9]+(?:\.[0-9]+)?)$", text
         )
