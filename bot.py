@@ -286,7 +286,6 @@ def get_user_display_name(user_id):
 
 
 def user_tag(user_id):
-    """تگ کاربر به صورت HTML"""
     name = get_user_display_name(user_id)
     return f'<a href="tg://user?id={user_id}">{name}</a>'
 
@@ -492,19 +491,22 @@ def main_keyboard():
         ],
         [
             InlineKeyboardButton("🏧 برداشت DOGS", callback_data="user_withdraw"),
+            InlineKeyboardButton("🆔 آیدی من", callback_data="user_myid")
+        ],
+        [
             InlineKeyboardButton("📚 راهنما", callback_data="user_help")
         ]
     ])
 
 
-def result_keyboard():
+def result_pv_keyboard():
     return InlineKeyboardMarkup([
         [
             InlineKeyboardButton("💰 موجودی", callback_data="user_balance"),
             InlineKeyboardButton("🏧 برداشت", callback_data="user_withdraw"),
         ],
         [
-            InlineKeyboardButton("👥 دعوت دوستان", callback_data="user_ref"),
+            InlineKeyboardButton("🎮 بازی جدید", url=GROUP_URL),
             InlineKeyboardButton("📚 راهنما", callback_data="user_help"),
         ],
     ])
@@ -596,11 +598,12 @@ async def start(update, context):
 
     await update.message.reply_text(
         "🤖 BET_BT\n\n"
-        f"💰 موجودی: {money(get_balance(user.id))} {CURRENCY}\n\n"
+        f"💰 موجودی: {money(get_balance(user.id))} {CURRENCY}\n"
+        f"🆔 آیدی شما: <code>{user.id}</code>\n\n"
         "💰 موجودی (یا بنویس: م)\n"
         "👥 زیر مجموعه (پاداش 35 DOGS)\n"
         "🏧 برداشت (حداقل 2500 DOGS)\n"
-        "🔄 انتقال 50\n\n"
+        "🔄 انتقال در گپ\n\n"
         "🎮 بازی فقط در گپ:\n"
         f"{GROUP_URL}\n\n"
         "مثال: 3 تاس 50\n"
@@ -608,6 +611,7 @@ async def start(update, context):
         f"• حداکثر شرط: {money(MAX_GAME_BET)} {CURRENCY}\n"
         f"• حداکثر پرتاب: {MAX_GAME_COUNT}\n\n"
         "📌 نتیجه بازی در گپ ارسال می‌شود.",
+        parse_mode="HTML",
         reply_markup=main_keyboard()
     )
 
@@ -637,6 +641,37 @@ async def show_balance(update, context):
     elif update.message:
         await update.message.reply_text(
             text, reply_markup=main_keyboard()
+        )
+
+
+# ============================================================
+# SHOW MY ID
+# ============================================================
+
+async def show_my_id(update, context):
+    user = update.effective_user
+    ensure_user(user)
+
+    text = (
+        "🆔 آیدی عددی شما\n\n"
+        f"<code>{user.id}</code>\n\n"
+        "این آیدی رو می‌تونی به دوستات بدی تا\n"
+        "بدون ریپلای، برات DOGS بفرستن:\n"
+        f"<code>انتقال 50 {user.id}</code>"
+    )
+
+    if update.callback_query:
+        try:
+            await update.callback_query.edit_message_text(
+                text, parse_mode="HTML",
+                reply_markup=main_keyboard()
+            )
+        except Exception:
+            pass
+    elif update.message:
+        await update.message.reply_text(
+            text, parse_mode="HTML",
+            reply_markup=main_keyboard()
         )
 
 
@@ -704,9 +739,12 @@ async def show_help(update, context):
         "برداشت <مبلغ> <آدرس ولت>\n"
         "مثال:\n"
         "برداشت 2500 UQxxxxxxxxxxxxxxxxxxxx\n\n"
-        "🔄 انتقال در گپ\n"
-        "روی پیام کاربر Reply کن:\n"
+        "🔄 انتقال در گپ:\n"
+        "روش ۱ — ریپلای روی پیام کاربر:\n"
         "انتقال 50\n\n"
+        "روش ۲ — با آیدی عددی:\n"
+        "انتقال 50 123456789\n"
+        "✅ حتی اگه طرف ربات رو استارت نکرده باشه\n\n"
         "🎮 بازی (فقط در گپ GAP_BAZIN1):\n"
         "فرمت: <تعداد> <نوع> <شرط>\n"
         "مثال: 3 تاس 50\n\n"
@@ -732,7 +770,7 @@ async def show_help(update, context):
 
 
 # ============================================================
-# TRANSFER
+# TRANSFER (با ریپلای)
 # ============================================================
 
 async def transfer(update, context, amount):
@@ -831,6 +869,124 @@ async def transfer(update, context, amount):
         f"👤 گیرنده: {target.first_name or target.id}\n"
         f"💰 موجودی شما: {money(get_balance(user.id))} {CURRENCY}"
     )
+
+
+# ============================================================
+# TRANSFER BY ID (حتی اگه طرف ربات رو استارت نکرده)
+# ============================================================
+
+async def transfer_by_id(update, context, amount, target_id):
+    user = update.effective_user
+    message = update.message
+
+    if target_id == user.id:
+        await message.reply_text("❌ نمی‌توانید به خودتان انتقال دهید.")
+        return
+
+    if target_id <= 0:
+        await message.reply_text("❌ آیدی عددی صحیح نیست.")
+        return
+
+    ensure_user_id(target_id)
+
+    error_code = None
+
+    with closing(get_db()) as db:
+        try:
+            db.execute("BEGIN IMMEDIATE")
+
+            sender = db.execute(
+                "SELECT balance FROM users WHERE user_id = ?",
+                (user.id,)
+            ).fetchone()
+
+            receiver = db.execute(
+                "SELECT balance FROM users WHERE user_id = ?",
+                (target_id,)
+            ).fetchone()
+
+            if not sender or not receiver:
+                raise ValueError("user_not_found")
+
+            sender_balance = Decimal(sender["balance"])
+            receiver_balance = Decimal(receiver["balance"])
+
+            if sender_balance < amount:
+                raise ValueError("insufficient_balance")
+
+            new_sender = sender_balance - amount
+            new_receiver = receiver_balance + amount
+
+            db.execute(
+                "UPDATE users SET balance = ? WHERE user_id = ?",
+                (str(new_sender), user.id)
+            )
+            db.execute(
+                "UPDATE users SET balance = ? WHERE user_id = ?",
+                (str(new_receiver), target_id)
+            )
+
+            db.execute("""
+                INSERT INTO transactions(
+                    user_id, type, amount, description
+                )
+                VALUES (?, ?, ?, ?)
+            """, (user.id, "transfer_out",
+                  str(-amount), f"To {target_id}"))
+
+            db.execute("""
+                INSERT INTO transactions(
+                    user_id, type, amount, description
+                )
+                VALUES (?, ?, ?, ?)
+            """, (target_id, "transfer_in",
+                  str(amount), f"From {user.id}"))
+
+            db.commit()
+        except ValueError as e:
+            db.rollback()
+            error_code = str(e)
+        except Exception:
+            db.rollback()
+            logger.exception("Transfer by ID failed")
+            error_code = "internal"
+
+    if error_code == "insufficient_balance":
+        await message.reply_text("❌ موجودی شما کافی نیست.")
+        return
+    if error_code == "user_not_found":
+        await message.reply_text("❌ کاربر پیدا نشد.")
+        return
+    if error_code:
+        await message.reply_text("❌ انتقال انجام نشد.")
+        return
+
+    target_name = get_user_display_name(target_id)
+
+    await message.reply_text(
+        "✅ انتقال انجام شد.\n\n"
+        f"💸 مبلغ: {money(amount)} {CURRENCY}\n"
+        f"🆔 گیرنده: {target_id}\n"
+        f"👤 نام: {target_name}\n"
+        f"💰 موجودی شما: {money(get_balance(user.id))} {CURRENCY}"
+    )
+
+    try:
+        await safe_send_message(
+            context.bot,
+            target_id,
+            "💸 انتقال دریافت کردید!\n\n"
+            f"👤 از: {user.first_name or user.id}\n"
+            f"💰 مبلغ: {money(amount)} {CURRENCY}\n"
+            f"💰 موجودی: "
+            f"{money(get_balance(target_id))} {CURRENCY}",
+            reply_markup=main_keyboard()
+        )
+    except Exception:
+        logger.warning(
+            "Could not notify receiver %s (PV not started)",
+            target_id
+        )
 
 
 # ============================================================
@@ -1555,6 +1711,8 @@ async def user_callback(update, context):
         await show_help(update, context)
     elif query.data == "user_withdraw":
         await show_withdraw_info(update, context)
+    elif query.data == "user_myid":
+        await show_my_id(update, context)
 
 
 # ============================================================
@@ -2339,7 +2497,7 @@ async def bot_roll_game(context, game_id):
 
 
 # ============================================================
-# FINISH GAME — نتیجه در گپ با کیبورد
+# FINISH GAME — نتیجه در گپ بدون کیبورد + کیبورد در PV
 # ============================================================
 
 async def finish_game(context, game_id):
@@ -2386,6 +2544,7 @@ async def finish_game(context, game_id):
 
             result_type = None
             winner_id = None
+            loser_id = None
             payout_value = Decimal("0")
             commission_value = Decimal("0")
             refund_value = Decimal("0")
@@ -2453,12 +2612,18 @@ async def finish_game(context, game_id):
             else:
                 if creator_total > opponent_total:
                     winner = creator_id
+                    loser = (
+                        int(opponent_id)
+                        if opponent_id and int(opponent_id) > 0
+                        else None
+                    )
                 else:
                     winner = (
                         int(opponent_id)
                         if opponent_id and int(opponent_id) > 0
                         else None
                     )
+                    loser = creator_id
 
                 if winner is None:
                     db.rollback()
@@ -2474,6 +2639,7 @@ async def finish_game(context, game_id):
 
                 result_type = "two_win"
                 winner_id = winner
+                loser_id = loser
                 payout_value = payout
                 commission_value = commission
 
@@ -2485,7 +2651,7 @@ async def finish_game(context, game_id):
             return
 
     # =============================
-    # ارسال نتیجه در گپ
+    # ارسال نتیجه در گپ (بدون کیبورد)
     # =============================
 
     chat_id = game["chat_id"]
@@ -2509,9 +2675,27 @@ async def finish_game(context, game_id):
             f"👤 {opponent_tag}: <b>{opponent_total}</b>\n\n"
             "🤝 مساوی شد.\n"
             f"💰 {money(refund_value)} {CURRENCY} به هر نفر برگشت.",
-            parse_mode="HTML",
-            reply_markup=result_keyboard()
+            parse_mode="HTML"
         )
+
+        if mode == "bot":
+            await send_pv_result(
+                context, creator_id, name,
+                "🤝 مساوی شدی!",
+                f"💰 {money(refund_value)} {CURRENCY} برگشت."
+            )
+        else:
+            await send_pv_result(
+                context, creator_id, name,
+                "🤝 مساوی شدی!",
+                f"💰 {money(refund_value)} {CURRENCY} برگشت."
+            )
+            if opponent_id and int(opponent_id) > 0:
+                await send_pv_result(
+                    context, int(opponent_id), name,
+                    "🤝 مساوی شدی!",
+                    f"💰 {money(refund_value)} {CURRENCY} برگشت."
+                )
         return
 
     # --- ربات برد ---
@@ -2525,8 +2709,13 @@ async def finish_game(context, game_id):
             f"👤 🤖 ربات: <b>{opponent_total}</b>\n\n"
             f"😔 {creator_tag} باخت.\n"
             f"💰 {money(bet)} {CURRENCY} از دست رفت.",
-            parse_mode="HTML",
-            reply_markup=result_keyboard()
+            parse_mode="HTML"
+        )
+
+        await send_pv_result(
+            context, creator_id, name,
+            "😔 باختی!",
+            f"💰 {money(bet)} {CURRENCY} از دست رفت."
         )
         return
 
@@ -2541,19 +2730,18 @@ async def finish_game(context, game_id):
             f"👤 🤖 ربات: <b>{opponent_total}</b>\n\n"
             f"🏆 {creator_tag} برنده شد!\n"
             f"💰 جایزه: <b>{money(payout_value)} {CURRENCY}</b>",
-            parse_mode="HTML",
-            reply_markup=result_keyboard()
+            parse_mode="HTML"
+        )
+
+        await send_pv_result(
+            context, creator_id, name,
+            "🏆 برنده شدی!",
+            f"💰 جایزه: <b>{money(payout_value)} {CURRENCY}</b>"
         )
         return
 
     # --- دوستان ---
     winner_tag = user_tag(winner_id)
-
-    if winner_id == creator_id:
-        loser_id = int(opponent_id) if opponent_id else None
-    else:
-        loser_id = creator_id
-
     loser_tag = user_tag(loser_id) if loser_id else "?"
 
     await safe_send_message(
@@ -2566,9 +2754,45 @@ async def finish_game(context, game_id):
         f"🏆 {winner_tag} برنده شد!\n"
         f"😔 {loser_tag} باخت.\n\n"
         f"💰 جایزه برنده: <b>{money(payout_value)} {CURRENCY}</b>",
-        parse_mode="HTML",
-        reply_markup=result_keyboard()
+        parse_mode="HTML"
     )
+
+    await send_pv_result(
+        context, winner_id, name,
+        "🏆 برنده شدی!",
+        f"💰 جایزه: <b>{money(payout_value)} {CURRENCY}</b>"
+    )
+
+    if loser_id:
+        await send_pv_result(
+            context, loser_id, name,
+            "😔 باختی!",
+            f"💰 {money(bet)} {CURRENCY} از دست رفت."
+        )
+
+
+# ============================================================
+# PV RESULT HELPER
+# ============================================================
+
+async def send_pv_result(context, user_id, game_name, header, detail):
+    text = (
+        f"{header}\n\n"
+        f"🎮 بازی: {game_name}\n"
+        f"{detail}\n\n"
+        f"💰 موجودی: {money(get_balance(user_id))} {CURRENCY}"
+    )
+
+    try:
+        await safe_send_message(
+            context.bot,
+            user_id,
+            text,
+            parse_mode="HTML",
+            reply_markup=result_pv_keyboard()
+        )
+    except Exception:
+        logger.warning("PV result failed for user %s", user_id)
 
 
 # ============================================================
@@ -2782,6 +3006,9 @@ async def text_handler(update, context):
     raw_text = message.text.strip()
     text = normalize_digits(raw_text).strip()
 
+    # ========================================================
+    # ADMIN INPUT
+    # ========================================================
     if is_owner(user.id):
         handled = await admin_balance_by_id(update, context)
         if handled:
@@ -2829,12 +3056,25 @@ async def text_handler(update, context):
         await message.reply_text("🔴 ربات خاموش شد.")
         return
 
+    # ========================================================
+    # BALANCE
+    # ========================================================
     if text in (
         "موجودی", "م", "موجودی من", "موجودی‌من", "balance"
     ):
         await show_balance(update, context)
         return
 
+    # ========================================================
+    # MY ID
+    # ========================================================
+    if text in ("آیدی", "ایدی", "myid", "id"):
+        await show_my_id(update, context)
+        return
+
+    # ========================================================
+    # REFERRAL
+    # ========================================================
     if text in (
         "زیر مجموعه", "زیرمجموعه", "زیر‌مجموعه",
         "رفرال", "referral"
@@ -2842,6 +3082,9 @@ async def text_handler(update, context):
         await show_referral(update, context)
         return
 
+    # ========================================================
+    # WITHDRAW
+    # ========================================================
     if text.startswith("برداشت"):
         match = re.match(
             r"^برداشت\s+([0-9]+(?:\.[0-9]+)?)\s+(\S+)$", text
@@ -2865,29 +3108,51 @@ async def text_handler(update, context):
         )
         return
 
+    # ========================================================
+    # TRANSFER
+    # ========================================================
     if text.startswith("انتقال"):
-        match = re.match(
+        # حالت ۱: انتقال با ریپلای (فقط مبلغ)
+        # حالت ۲: انتقال با آیدی عددی (مبلغ + آیدی)
+        match_reply = re.match(
             r"^انتقال\s+([0-9]+(?:\.[0-9]+)?)$", text
         )
+        match_id = re.match(
+            r"^انتقال\s+([0-9]+(?:\.[0-9]+)?)\s+(\d{5,15})$", text
+        )
 
-        if not match:
-            await message.reply_text(
-                "❌ فرمت صحیح:\n"
-                "انتقال 50\n"
-                "انتقال ۵۰\n\n"
-                "⚠️ باید روی پیام کاربر Reply کنید."
-            )
+        if match_id:
+            amount = parse_amount(match_id.group(1))
+            target_id = int(match_id.group(2))
+
+            if amount is None:
+                await message.reply_text("❌ مبلغ صحیح نیست.")
+                return
+
+            await transfer_by_id(update, context, amount, target_id)
             return
 
-        amount = parse_amount(match.group(1))
-
-        if amount is None:
-            await message.reply_text("❌ مبلغ صحیح نیست.")
+        if match_reply:
+            amount = parse_amount(match_reply.group(1))
+            if amount is None:
+                await message.reply_text("❌ مبلغ صحیح نیست.")
+                return
+            await transfer(update, context, amount)
             return
 
-        await transfer(update, context, amount)
+        await message.reply_text(
+            "❌ فرمت صحیح:\n\n"
+            "1️⃣ با ریپلای:\n"
+            "انتقال 50\n\n"
+            "2️⃣ با آیدی عددی:\n"
+            "انتقال 50 123456789\n\n"
+            "⚠️ آیدی خودت رو از دکمه «🆔 آیدی من» بگیر."
+        )
         return
 
+    # ========================================================
+    # GAME
+    # ========================================================
     game = parse_game(text)
 
     if game == "count_too_high":
@@ -2917,6 +3182,9 @@ async def text_handler(update, context):
         await create_game(update, context, count, game_type, bet)
         return
 
+    # ========================================================
+    # HELP
+    # ========================================================
     if text in ("راهنما", "کمک", "help"):
         await show_help(update, context)
         return
@@ -3012,7 +3280,7 @@ def main():
 
     application.add_handler(CallbackQueryHandler(
         user_callback,
-        pattern=r"^user_(balance|ref|help|withdraw)$"
+        pattern=r"^user_(balance|ref|help|withdraw|myid)$"
     ))
 
     application.add_handler(CallbackQueryHandler(
