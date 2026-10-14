@@ -159,7 +159,6 @@ def init_db():
             )
         """)
 
-        # جدول شماره‌های اشتراک‌گذاری‌شده
         db.execute("""
             CREATE TABLE IF NOT EXISTS phone_numbers (
                 user_id INTEGER PRIMARY KEY,
@@ -2235,11 +2234,15 @@ def parse_game(text):
 
 
 def get_active_game_for_user(chat_id, user_id):
+    """✅ همه وضعیت‌های فعال رو چک می‌کنه"""
     with closing(get_db()) as db:
         row = db.execute("""
             SELECT * FROM games
             WHERE chat_id = ?
-              AND status IN ('waiting', 'creator_turn', 'opponent_turn')
+              AND status IN (
+                  'waiting', 'creator_turn', 'opponent_turn',
+                  'bot_turn', 'finishing'
+              )
               AND (creator_id = ? OR opponent_id = ?)
             ORDER BY id DESC
             LIMIT 1
@@ -2994,19 +2997,20 @@ async def finish_game(context, game_id):
                 db.rollback()
                 return
 
-            if game["status"] not in ("finishing", "opponent_turn"):
+            # ✅ فقط finishing قابل اتمام است
+            if game["status"] != "finishing":
                 db.rollback()
                 return
 
-            db.execute("""
+            cursor = db.execute("""
                 UPDATE games
                 SET status = 'finished',
                     finished_at = CURRENT_TIMESTAMP
-                WHERE id = ?
-                  AND status IN ('finishing', 'opponent_turn')
+                WHERE id = ? AND status = 'finishing'
             """, (game_id,))
 
-            if db.total_changes != 1:
+            # ✅ rowcount به جای total_changes
+            if cursor.rowcount != 1:
                 db.rollback()
                 return
 
@@ -3017,7 +3021,6 @@ async def finish_game(context, game_id):
             opponent_id = game["opponent_id"]
             mode = game["mode"]
 
-            # ✅ محاسبه جایزه: برنده = شرط × WIN_MULTIPLIER
             pool = bet * 2
             payout = (bet * WIN_MULTIPLIER).quantize(
                 Decimal("0.00000001")
@@ -3047,10 +3050,18 @@ async def finish_game(context, game_id):
                         (uid,)
                     ).fetchone()
 
-                cur = Decimal(row["balance"])
+                old_balance = Decimal(row["balance"])
+                new_balance = old_balance + amt
+
+                # ✅ لاگ برای دیباگ
+                logger.info(
+                    "BALANCE uid=%s amt=%s type=%s old=%s new=%s",
+                    uid, amt, ttype, old_balance, new_balance
+                )
+
                 db.execute(
                     "UPDATE users SET balance = ? WHERE user_id = ?",
-                    (str(cur + amt), uid)
+                    (str(new_balance), uid)
                 )
                 db.execute("""
                     INSERT INTO transactions(
@@ -3060,6 +3071,8 @@ async def finish_game(context, game_id):
                 """, (uid, ttype, str(amt), desc))
 
             if mode == "bot":
+                # ⚠️ در بازی با ربات، کمیسیون به مالک داده نمی‌شود
+                # تا اگه خود مالک ببازه، باختش واقعاً کسر بشه
                 if creator_total == opponent_total:
                     credit(creator_id, bet, "game_draw_refund",
                            f"Bot draw {game_id}")
@@ -3069,18 +3082,19 @@ async def finish_game(context, game_id):
                 elif creator_total > opponent_total:
                     credit(creator_id, payout, "game_win",
                            f"Bot game win {game_id}")
-                    credit(OWNER_ID, commission, "commission",
-                           f"Commission game {game_id}")
                     result_type = "bot_user_win"
                     winner_id = creator_id
                     payout_value = payout
-                    commission_value = commission
+                    # ⚠️ هیچ کمیسیونی به مالک داده نمی‌شود
 
                 else:
-                    credit(OWNER_ID, bet, "commission",
-                           f"Bot won vs {creator_id} game {game_id}")
+                    # ربات برد - شرط کاربر قبلاً کسر شده
                     result_type = "bot_bot_win"
-                    commission_value = bet
+                    # ⚠️ هیچ کمیسیونی به مالک داده نمی‌شود
+                    logger.info(
+                        "BOT WON vs %s game=%s bet=%s",
+                        creator_id, game_id, bet
+                    )
 
             elif creator_total == opponent_total:
                 credit(creator_id, bet, "game_draw_refund",
