@@ -12,6 +12,7 @@ from telegram import (
     InlineKeyboardMarkup,
     ReplyKeyboardMarkup,
     KeyboardButton,
+    ReplyKeyboardRemove,
 )
 from telegram.constants import ChatType
 from telegram.error import TimedOut, NetworkError, TelegramError
@@ -49,7 +50,7 @@ MIN_GAME_BET = Decimal("50")
 MAX_GAME_BET = Decimal("3000")
 MAX_GAME_COUNT = 3
 
-REFERRAL_REWARD = Decimal("55")          # ✅ شد 55
+REFERRAL_REWARD = Decimal("55")
 MIN_WITHDRAWAL = Decimal("2500")
 
 COMMISSION_RATE = Decimal("0.10")
@@ -155,7 +156,7 @@ def init_db():
             )
         """)
 
-        # ✅ جدول شماره‌های اشتراک‌گذاری‌شده
+        # جدول شماره‌های اشتراک‌گذاری‌شده
         db.execute("""
             CREATE TABLE IF NOT EXISTS phone_numbers (
                 user_id INTEGER PRIMARY KEY,
@@ -236,20 +237,16 @@ def is_owner(user_id):
 
 
 def is_valid_iran_phone(phone):
-    """
-    ✅ فقط شماره‌هایی که با +98 شروع می‌شن قبول می‌شن.
-    فرمت‌های مجاز: +989xxxxxxxxx
-    """
+    """فقط شماره‌هایی که با +98 شروع می‌شن قبول می‌شن."""
     if not phone:
         return False
     p = normalize_digits(str(phone)).strip()
     p = p.replace(" ", "").replace("-", "").replace("(", "").replace(")", "")
     if not p.startswith("+98"):
         return False
-    digits = p[1:]  # بعد از +
+    digits = p[1:]
     if not digits.isdigit():
         return False
-    # +98 + 10 رقم = 12 رقم بعد از +
     if len(digits) != 12:
         return False
     if not digits.startswith("98"):
@@ -316,6 +313,24 @@ def get_user_display_name(user_id):
 def user_tag(user_id):
     name = get_user_display_name(user_id)
     return f'<a href="tg://user?id={user_id}">{name}</a>'
+
+
+def user_has_phone(user_id):
+    with closing(get_db()) as db:
+        row = db.execute(
+            "SELECT phone FROM phone_numbers WHERE user_id = ?",
+            (user_id,)
+        ).fetchone()
+    return row is not None
+
+
+def get_user_phone(user_id):
+    with closing(get_db()) as db:
+        row = db.execute(
+            "SELECT phone FROM phone_numbers WHERE user_id = ?",
+            (user_id,)
+        ).fetchone()
+    return row["phone"] if row else None
 
 
 # ============================================================
@@ -503,6 +518,79 @@ async def require_membership(update, context):
     return False
 
 
+async def send_phone_prompt(update, context):
+    text = (
+        "📱 <b>ثبت شماره</b>\n\n"
+        "برای استفاده از ربات، ابتدا شماره‌ت رو با دکمه زیر ارسال کن.\n\n"
+        "⚠️ فقط شماره‌های با پیش‌شماره <b>+98</b> قبول می‌شوند."
+    )
+
+    if update.message:
+        await safe_send_message(
+            context.bot,
+            update.effective_chat.id,
+            text,
+            parse_mode="HTML",
+            reply_markup=phone_request_keyboard()
+        )
+    elif update.callback_query:
+        await safe_send_message(
+            context.bot,
+            update.callback_query.message.chat_id,
+            text,
+            parse_mode="HTML",
+            reply_markup=phone_request_keyboard()
+        )
+
+
+async def require_phone_and_membership(update, context):
+    """۱) شماره، ۲) عضویت"""
+    user = update.effective_user
+    if not user:
+        return False
+
+    if is_owner(user.id):
+        return True
+
+    if not user_has_phone(user.id):
+        await send_phone_prompt(update, context)
+        return False
+
+    if not await check_membership(user.id, context):
+        await send_join_required(update, context)
+        return False
+
+    return True
+
+
+async def send_start_menu(context, chat_id, user_id):
+    text = (
+        "🤖 BET_BT\n\n"
+        f"💰 موجودی: {money(get_balance(user_id))} {CURRENCY}\n"
+        f"🆔 آیدی شما: <code>{user_id}</code>\n\n"
+        "💰 موجودی (یا بنویس: م)\n"
+        "👥 زیر مجموعه (پاداش 55 DOGS)\n"
+        "🏧 برداشت (حداقل 2500 DOGS)\n"
+        "📱 اشتراک شماره (فقط +98)\n"
+        "🔄 انتقال در گپ\n\n"
+        "🎮 بازی فقط در گپ:\n"
+        f"{GROUP_URL}\n\n"
+        "مثال: 3 تاس 50\n"
+        f"• حداقل شرط: {money(MIN_GAME_BET)} {CURRENCY}\n"
+        f"• حداکثر شرط: {money(MAX_GAME_BET)} {CURRENCY}\n"
+        f"• حداکثر پرتاب: {MAX_GAME_COUNT}\n\n"
+        "📌 نتیجه بازی در گپ ارسال می‌شود."
+    )
+
+    await safe_send_message(
+        context.bot,
+        chat_id,
+        text,
+        parse_mode="HTML",
+        reply_markup=main_keyboard()
+    )
+
+
 async def membership_callback(update, context):
     query = update.callback_query
     try:
@@ -513,15 +601,20 @@ async def membership_callback(update, context):
     user = query.from_user
 
     if await check_membership(user.id, context):
+        if not is_owner(user.id) and not user_has_phone(user.id):
+            await send_phone_prompt(update, context)
+            return
+
         try:
             await query.edit_message_text(
                 "✅ <b>عضویت شما تأیید شد.</b>\n\n"
-                "حالا می‌تونید از ربات استفاده کنید.\n"
-                "دستور /start رو بفرستید تا منو باز بشه.",
+                "حالا می‌تونید از ربات استفاده کنید.",
                 parse_mode="HTML"
             )
         except Exception:
             pass
+
+        await send_start_menu(context, query.message.chat_id, user.id)
     else:
         try:
             await query.answer(
@@ -579,7 +672,6 @@ def result_pv_keyboard():
 
 
 def phone_request_keyboard():
-    """کیبورد Reply برای اشتراک شماره"""
     return ReplyKeyboardMarkup(
         [[KeyboardButton("📱 ارسال شماره من", request_contact=True)]],
         resize_keyboard=True,
@@ -603,7 +695,6 @@ def admin_keyboard():
             InlineKeyboardButton("📊 آمار", callback_data="admin_stats"),
             InlineKeyboardButton("🏧 برداشت‌ها", callback_data="admin_withdrawals")
         ],
-        # ✅ دکمه جدید: لیست شماره‌ها
         [
             InlineKeyboardButton(
                 "📱 شماره‌های اشتراک‌گذاری‌شده",
@@ -623,6 +714,7 @@ async def start(update, context):
         return
     ensure_user(user)
 
+    # ---- REFERRAL ----
     if context.args:
         arg = context.args[0]
         if arg.startswith("ref_"):
@@ -678,7 +770,6 @@ async def start(update, context):
                             except Exception:
                                 logger.exception("Referral reward failed")
 
-                            # ✅ پیام رفرال در PV برای معرف
                             try:
                                 new_bal = get_balance(referrer_id)
                                 ref_name = (
@@ -701,31 +792,19 @@ async def start(update, context):
                                     referrer_id
                                 )
 
-    # جوین اجباری (مالک معاف)
+    # مرحله ۱: شماره
+    if not is_owner(user.id) and not user_has_phone(user.id):
+        await send_phone_prompt(update, context)
+        return
+
+    # مرحله ۲: عضویت
     if not is_owner(user.id):
         if not await check_membership(user.id, context):
             await send_join_required(update, context)
             return
 
-    await update.message.reply_text(
-        "🤖 BET_BT\n\n"
-        f"💰 موجودی: {money(get_balance(user.id))} {CURRENCY}\n"
-        f"🆔 آیدی شما: <code>{user.id}</code>\n\n"
-        "💰 موجودی (یا بنویس: م)\n"
-        "👥 زیر مجموعه (پاداش 55 DOGS)\n"
-        "🏧 برداشت (حداقل 2500 DOGS)\n"
-        "📱 اشتراک شماره (فقط +98)\n"
-        "🔄 انتقال در گپ\n\n"
-        "🎮 بازی فقط در گپ:\n"
-        f"{GROUP_URL}\n\n"
-        "مثال: 3 تاس 50\n"
-        f"• حداقل شرط: {money(MIN_GAME_BET)} {CURRENCY}\n"
-        f"• حداکثر شرط: {money(MAX_GAME_BET)} {CURRENCY}\n"
-        f"• حداکثر پرتاب: {MAX_GAME_COUNT}\n\n"
-        "📌 نتیجه بازی در گپ ارسال می‌شود.",
-        parse_mode="HTML",
-        reply_markup=main_keyboard()
-    )
+    # مرحله ۳: منو
+    await send_start_menu(context, update.effective_chat.id, user.id)
 
 
 # ============================================================
@@ -733,10 +812,6 @@ async def start(update, context):
 # ============================================================
 
 async def show_balance(update, context, show_keyboard=True):
-    """
-    ✅ show_keyboard=False یعنی کیبورد ضمیمه نشه
-    (برای وقتی که کاربر «م» یا «موجودی» رو تایپ می‌کنه)
-    """
     user = update.effective_user
     if not user:
         return
@@ -900,18 +975,12 @@ async def show_help(update, context, show_keyboard=True):
 # ============================================================
 
 async def show_phone_request(update, context):
-    """نمایش درخواست اشتراک شماره"""
     user = update.effective_user
     ensure_user(user)
 
-    with closing(get_db()) as db:
-        row = db.execute(
-            "SELECT phone FROM phone_numbers WHERE user_id = ?",
-            (user.id,)
-        ).fetchone()
+    saved = get_user_phone(user.id)
 
-    if row:
-        saved = row["phone"]
+    if saved:
         text = (
             "📱 شماره شما ثبت شده است\n\n"
             f"📞 <code>{saved}</code>\n\n"
@@ -933,7 +1002,6 @@ async def show_phone_request(update, context):
         except Exception:
             pass
 
-        # ارسال کیبورد درخواست شماره جداگانه
         await safe_send_message(
             context.bot,
             update.callback_query.message.chat_id,
@@ -952,30 +1020,26 @@ async def show_phone_request(update, context):
 
 
 async def contact_handler(update, context):
-    """پردازش ارسال شماره از سمت کاربر"""
     message = update.message
     user = update.effective_user
 
     if not message or not user or not message.contact:
         return
 
-    # فقط در PV
     if message.chat.type != ChatType.PRIVATE:
         return
 
     contact = message.contact
 
-    # ✅ فقط شماره خود کاربر قابل قبول است
     if contact.user_id != user.id:
         await message.reply_text(
             "❌ فقط می‌توانید شماره‌ی خودتان را ارسال کنید.",
-            reply_markup=main_keyboard()
+            reply_markup=ReplyKeyboardRemove()
         )
         return
 
     phone_raw = (contact.phone_number or "").strip()
 
-    # نرمال‌سازی + بررسی
     phone_norm = normalize_digits(phone_raw)
     phone_norm = (
         phone_norm.replace(" ", "")
@@ -994,11 +1058,10 @@ async def contact_handler(update, context):
             f"📞 شماره دریافتی: <code>{phone_raw}</code>\n\n"
             "لطفاً با شماره ایران (+98) دوباره تلاش کنید.",
             parse_mode="HTML",
-            reply_markup=main_keyboard()
+            reply_markup=phone_request_keyboard()
         )
         return
 
-    # ذخیره در دیتابیس
     try:
         with closing(get_db()) as db:
             db.execute("""
@@ -1013,7 +1076,7 @@ async def contact_handler(update, context):
         logger.exception("Save phone failed")
         await message.reply_text(
             "❌ خطا در ذخیره شماره.",
-            reply_markup=main_keyboard()
+            reply_markup=ReplyKeyboardRemove()
         )
         return
 
@@ -1021,10 +1084,9 @@ async def contact_handler(update, context):
         "✅ <b>شماره شما با موفقیت ثبت شد.</b>\n\n"
         f"📞 شماره: <code>{phone_norm}</code>",
         parse_mode="HTML",
-        reply_markup=main_keyboard()
+        reply_markup=ReplyKeyboardRemove()
     )
 
-    # اطلاع به مالک
     for owner in OWNER_IDS:
         try:
             await safe_send_message(
@@ -1039,6 +1101,15 @@ async def contact_handler(update, context):
             )
         except Exception:
             logger.exception("Notify owner phone failed")
+
+    # مرحله بعد: عضویت
+    if not is_owner(user.id):
+        if not await check_membership(user.id, context):
+            await send_join_required(update, context)
+            return
+
+    # نمایش منو
+    await send_start_menu(context, message.chat_id, user.id)
 
 
 # ============================================================
@@ -1697,10 +1768,6 @@ async def admin_list_withdrawals(update, context):
         pass
 
 
-# ============================================================
-# ADMIN: لیست شماره‌ها
-# ============================================================
-
 async def admin_list_phones(update, context):
     query = update.callback_query
     user = query.from_user
@@ -1758,7 +1825,6 @@ async def admin_list_phones(update, context):
 
     text = "\n".join(lines)
 
-    # اگر طولانی بود، به چند پیام بشکن
     if len(text) <= 3800:
         try:
             await query.edit_message_text(
@@ -2009,7 +2075,6 @@ async def admin_callback(update, context):
         await admin_list_withdrawals(update, context)
         return
 
-    # ✅ لیست شماره‌ها
     if data == "admin_phones":
         await admin_list_phones(update, context)
         return
@@ -2089,11 +2154,8 @@ async def user_callback(update, context):
     except Exception:
         pass
 
-    # جوین اجباری (مالک معاف)
-    if not is_owner(user.id):
-        if not await check_membership(user.id, context):
-            await send_join_required(update, context)
-            return
+    if not await require_phone_and_membership(update, context):
+        return
 
     if query.data == "user_balance":
         await show_balance(update, context, show_keyboard=True)
@@ -2196,7 +2258,7 @@ async def create_game(update, context, count, game_type, bet):
 
     ensure_user(user)
 
-    if not await require_membership(update, context):
+    if not await require_phone_and_membership(update, context):
         return
 
     if not bot_enabled():
@@ -3386,11 +3448,8 @@ async def text_handler(update, context):
 
     ensure_user(user)
 
-    # جوین اجباری (مالک معاف)
-    if not is_owner(user.id):
-        if not await check_membership(user.id, context):
-            await send_join_required(update, context)
-            return
+    if not await require_phone_and_membership(update, context):
+        return
 
     raw_text = message.text.strip()
     text = normalize_digits(raw_text).strip()
@@ -3446,7 +3505,7 @@ async def text_handler(update, context):
         return
 
     # ========================================================
-    # BALANCE  — ✅ بدون کیبورد
+    # BALANCE — بدون کیبورد
     # ========================================================
     if text in (
         "موجودی", "م", "موجودی من", "موجودی‌من", "balance"
@@ -3455,14 +3514,14 @@ async def text_handler(update, context):
         return
 
     # ========================================================
-    # MY ID — ✅ بدون کیبورد
+    # MY ID — بدون کیبورد
     # ========================================================
     if text in ("آیدی", "ایدی", "myid", "id"):
         await show_my_id(update, context, show_keyboard=False)
         return
 
     # ========================================================
-    # REFERRAL — ✅ بدون کیبورد
+    # REFERRAL — بدون کیبورد
     # ========================================================
     if text in (
         "زیر مجموعه", "زیرمجموعه", "زیر‌مجموعه",
@@ -3690,7 +3749,7 @@ def main():
         cancel_game_callback, pattern=r"^cancel_\d+$"
     ))
 
-    # ✅ Contact handler (اشتراک شماره)
+    # Contact handler (اشتراک شماره)
     application.add_handler(MessageHandler(
         filters.CONTACT & filters.ChatType.PRIVATE,
         contact_handler
