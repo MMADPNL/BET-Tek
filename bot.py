@@ -55,6 +55,9 @@ MIN_WITHDRAWAL = Decimal("2500")
 
 COMMISSION_RATE = Decimal("0.10")
 
+# ✅ ضریب برد (1.8 = برنده 1.8 برابر شرط می‌گیرد)
+WIN_MULTIPLIER = Decimal("1.8")
+
 GAME_TIMEOUT_MINUTES = 30
 
 # ============================================================
@@ -951,7 +954,7 @@ async def show_help(update, context, show_keyboard=True):
         f"• حداکثر شرط: {money(MAX_GAME_BET)} {CURRENCY}\n"
         f"• حداکثر تعداد پرتاب: {MAX_GAME_COUNT}\n\n"
         "انواع بازی:\n"
-        "🎲 تاس\n🎯 دارت\n🎳 بولینگ\n\n"
+        "🎲 تاس\n🎯 دارت\n🎳 بولینگ\n🏀 بسکتبال\n\n"
         "📌 نتیجه بازی در گپ ارسال می‌شود."
     )
 
@@ -2172,26 +2175,29 @@ async def user_callback(update, context):
 
 
 # ============================================================
-# GAME CONFIG (بسکتبال حذف شد)
+# GAME CONFIG (با بسکتبال)
 # ============================================================
 
 GAME_INFO = {
     "dice": ("🎲", "تاس"),
     "darts": ("🎯", "دارت"),
     "bowling": ("🎳", "بولینگ"),
+    "basketball": ("🏀", "بسکتبال"),
 }
 
 GAME_NAMES = {
     "تاس": "dice", "دارت": "darts", "دارتس": "darts",
     "بولینگ": "bowling", "بولينگ": "bowling",
+    "بسکتبال": "basketball",
     "dice": "dice", "darts": "darts",
-    "bowling": "bowling",
+    "bowling": "bowling", "basketball": "basketball",
 }
 
 GAME_EMOJI = {
     "dice": "🎲",
     "darts": "🎯",
     "bowling": "🎳",
+    "basketball": "🏀",
 }
 
 
@@ -2246,6 +2252,24 @@ def get_game(game_id):
         return db.execute(
             "SELECT * FROM games WHERE id = ?", (game_id,)
         ).fetchone()
+
+
+# ============================================================
+# GAME SCORING HELPERS
+# ============================================================
+
+def dice_to_points(game_type, dice_value):
+    """بسکتبال: 4 یا 5 = گل (1 امتیاز)، 1-3 = اوت (0)"""
+    if game_type == "basketball":
+        return 1 if int(dice_value) >= 4 else 0
+    return int(dice_value)
+
+
+def format_score(game_type, score):
+    """برای بسکتبال، تعداد گل رو نشون بده"""
+    if game_type == "basketball":
+        return f"{score} گل"
+    return str(score)
 
 
 # ============================================================
@@ -2769,7 +2793,9 @@ async def user_game_dice_handler(update, context):
 
                 new_rolls = rolls + 1
                 current_total = int(fresh["creator_total"])
-                new_total = current_total + int(message.dice.value)
+                new_total = current_total + dice_to_points(
+                    game_type, message.dice.value
+                )
 
                 if new_rolls >= int(fresh["count"]):
                     if fresh["mode"] == "bot":
@@ -2849,7 +2875,9 @@ async def user_game_dice_handler(update, context):
 
                 new_rolls = rolls + 1
                 current_total = int(fresh["opponent_total"])
-                new_total = current_total + int(message.dice.value)
+                new_total = current_total + dice_to_points(
+                    game_type, message.dice.value
+                )
 
                 if new_rolls >= int(fresh["count"]):
                     new_status = "finishing"
@@ -2916,7 +2944,7 @@ async def bot_roll_game(context, game_id):
             return None
 
         try:
-            total += int(msg.dice.value)
+            total += dice_to_points(game["game_type"], msg.dice.value)
         except Exception:
             pass
 
@@ -2989,11 +3017,12 @@ async def finish_game(context, game_id):
             opponent_id = game["opponent_id"]
             mode = game["mode"]
 
+            # ✅ محاسبه جایزه: برنده = شرط × WIN_MULTIPLIER
             pool = bet * 2
-            commission = (pool * COMMISSION_RATE).quantize(
+            payout = (bet * WIN_MULTIPLIER).quantize(
                 Decimal("0.00000001")
             )
-            payout = pool - commission
+            commission = pool - payout
 
             result_type = None
             winner_id = None
@@ -3106,6 +3135,9 @@ async def finish_game(context, game_id):
     chat_id = game["chat_id"]
     emoji, name = GAME_INFO[game["game_type"]]
 
+    creator_display = format_score(game["game_type"], creator_total)
+    opponent_display = format_score(game["game_type"], opponent_total)
+
     creator_tag = user_tag(creator_id)
 
     if mode == "bot":
@@ -3119,8 +3151,8 @@ async def finish_game(context, game_id):
             chat_id,
             "🏁 <b>نتیجه بازی</b>\n\n"
             f"{emoji} {name}\n\n"
-            f"👤 {creator_tag}: <b>{creator_total}</b>\n"
-            f"👤 {opponent_tag}: <b>{opponent_total}</b>\n\n"
+            f"👤 {creator_tag}: <b>{creator_display}</b>\n"
+            f"👤 {opponent_tag}: <b>{opponent_display}</b>\n\n"
             "🤝 مساوی شد.\n"
             f"💰 {money(refund_value)} {CURRENCY} به هر نفر برگشت.",
             parse_mode="HTML"
@@ -3152,8 +3184,8 @@ async def finish_game(context, game_id):
             chat_id,
             "🏁 <b>نتیجه بازی</b>\n\n"
             f"{emoji} {name}\n\n"
-            f"👤 {creator_tag}: <b>{creator_total}</b>\n"
-            f"👤 🤖 ربات: <b>{opponent_total}</b>\n\n"
+            f"👤 {creator_tag}: <b>{creator_display}</b>\n"
+            f"👤 🤖 ربات: <b>{opponent_display}</b>\n\n"
             f"😔 {creator_tag} باخت.\n"
             f"💰 {money(bet)} {CURRENCY} از دست رفت.",
             parse_mode="HTML"
@@ -3172,8 +3204,8 @@ async def finish_game(context, game_id):
             chat_id,
             "🏁 <b>نتیجه بازی</b>\n\n"
             f"{emoji} {name}\n\n"
-            f"👤 {creator_tag}: <b>{creator_total}</b>\n"
-            f"👤 🤖 ربات: <b>{opponent_total}</b>\n\n"
+            f"👤 {creator_tag}: <b>{creator_display}</b>\n"
+            f"👤 🤖 ربات: <b>{opponent_display}</b>\n\n"
             f"🏆 {creator_tag} برنده شد!\n"
             f"💰 جایزه: <b>{money(payout_value)} {CURRENCY}</b>",
             parse_mode="HTML"
@@ -3194,8 +3226,8 @@ async def finish_game(context, game_id):
         chat_id,
         "🏁 <b>نتیجه بازی</b>\n\n"
         f"{emoji} {name}\n\n"
-        f"👤 {creator_tag}: <b>{creator_total}</b>\n"
-        f"👤 {opponent_tag}: <b>{opponent_total}</b>\n\n"
+        f"👤 {creator_tag}: <b>{creator_display}</b>\n"
+        f"👤 {opponent_tag}: <b>{opponent_display}</b>\n\n"
         f"🏆 {winner_tag} برنده شد!\n"
         f"😔 {loser_tag} باخت.\n\n"
         f"💰 جایزه برنده: <b>{money(payout_value)} {CURRENCY}</b>",
