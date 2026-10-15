@@ -5,6 +5,7 @@ import logging
 import asyncio
 from decimal import Decimal, InvalidOperation
 from contextlib import closing
+from html import escape as html_escape
 
 from telegram import (
     Update,
@@ -44,14 +45,14 @@ GAME_CHAT_USERNAME = "GAP_BAZIN1"
 
 DB_FILE = "bot.db"
 
-CURRENCY = "DOGS"
+CURRENCY = "TRX"
 
-MIN_GAME_BET = Decimal("50")
-MAX_GAME_BET = Decimal("3000")
+MIN_GAME_BET = Decimal("0.5")
+MAX_GAME_BET = Decimal("30")
 MAX_GAME_COUNT = 3
 
-REFERRAL_REWARD = Decimal("55")
-MIN_WITHDRAWAL = Decimal("2500")
+DEFAULT_REFERRAL_REWARD = Decimal("0.05")
+MIN_WITHDRAWAL = Decimal("3.2")
 
 COMMISSION_RATE = Decimal("0.10")
 
@@ -59,6 +60,10 @@ COMMISSION_RATE = Decimal("0.10")
 WIN_MULTIPLIER = Decimal("1.8")
 
 GAME_TIMEOUT_MINUTES = 30
+
+# ✅ state برای ارسال مدرک توسط مالک
+# { owner_id: target_user_id }
+PENDING_PROOF: dict = {}
 
 # ============================================================
 # LOGGING
@@ -195,6 +200,11 @@ def init_db():
             VALUES ('bot_enabled', '1')
         """)
 
+        db.execute("""
+            INSERT OR IGNORE INTO settings(key, value)
+            VALUES ('referral_reward', ?)
+        """, (str(DEFAULT_REFERRAL_REWARD),))
+
         db.commit()
 
 
@@ -231,6 +241,11 @@ def money(value):
     return f"{value:.8f}".rstrip("0").rstrip(".")
 
 
+def safe_name(name):
+    """HTML-escape نام کاربر"""
+    return html_escape(str(name or ""))
+
+
 def is_owner(user_id):
     try:
         return int(user_id) in OWNER_IDS
@@ -254,6 +269,14 @@ def is_valid_iran_phone(phone):
     if not digits.startswith("98"):
         return False
     return True
+
+
+def is_valid_trx_address(addr):
+    """آدرس TRX: با T شروع می‌شه و 34 کاراکتره"""
+    if not addr:
+        return False
+    a = str(addr).strip()
+    return bool(re.match(r"^T[A-Za-z0-9]{33}$", a))
 
 
 def ensure_user(user):
@@ -313,7 +336,7 @@ def get_user_display_name(user_id):
 
 
 def user_tag(user_id):
-    name = get_user_display_name(user_id)
+    name = safe_name(get_user_display_name(user_id))
     return f'<a href="tg://user?id={user_id}">{name}</a>'
 
 
@@ -333,6 +356,30 @@ def get_user_phone(user_id):
             (user_id,)
         ).fetchone()
     return row["phone"] if row else None
+
+
+def get_referral_reward():
+    with closing(get_db()) as db:
+        row = db.execute(
+            "SELECT value FROM settings WHERE key = 'referral_reward'"
+        ).fetchone()
+    if row:
+        try:
+            return Decimal(row["value"])
+        except Exception:
+            pass
+    return DEFAULT_REFERRAL_REWARD
+
+
+def set_referral_reward(value):
+    with closing(get_db()) as db:
+        db.execute("""
+            INSERT INTO settings(key, value)
+            VALUES ('referral_reward', ?)
+            ON CONFLICT(key)
+            DO UPDATE SET value = excluded.value
+        """, (str(value),))
+        db.commit()
 
 
 # ============================================================
@@ -571,13 +618,13 @@ async def send_start_menu(context, chat_id, user_id):
         f"💰 موجودی: {money(get_balance(user_id))} {CURRENCY}\n"
         f"🆔 آیدی شما: <code>{user_id}</code>\n\n"
         "💰 موجودی (یا بنویس: م)\n"
-        "👥 زیر مجموعه (پاداش 55 DOGS)\n"
-        "🏧 برداشت (حداقل 2500 DOGS)\n"
+        f"👥 زیر مجموعه (پاداش {money(get_referral_reward())} {CURRENCY})\n"
+        f"🏧 برداشت (حداقل {money(MIN_WITHDRAWAL)} {CURRENCY})\n"
         "📱 اشتراک شماره (فقط +98)\n"
         "🔄 انتقال در گپ\n\n"
         "🎮 بازی فقط در گپ:\n"
         f"{GROUP_URL}\n\n"
-        "مثال: 3 تاس 50\n"
+        f"مثال: 3 تاس 0.5\n"
         f"• حداقل شرط: {money(MIN_GAME_BET)} {CURRENCY}\n"
         f"• حداکثر شرط: {money(MAX_GAME_BET)} {CURRENCY}\n"
         f"• حداکثر پرتاب: {MAX_GAME_COUNT}\n\n"
@@ -650,7 +697,7 @@ def main_keyboard():
             InlineKeyboardButton("👥 زیرمجموعه", callback_data="user_ref")
         ],
         [
-            InlineKeyboardButton("🏧 برداشت DOGS", callback_data="user_withdraw"),
+            InlineKeyboardButton("🏧 برداشت TRX", callback_data="user_withdraw"),
             InlineKeyboardButton("🆔 آیدی من", callback_data="user_myid")
         ],
         [
@@ -681,8 +728,15 @@ def phone_request_keyboard():
     )
 
 
+def cancel_withdraw_keyboard():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("❌ انصراف از برداشت", callback_data="wd_cancel")]
+    ])
+
+
 def admin_keyboard():
     status = "🟢 روشن" if bot_enabled() else "🔴 خاموش"
+    reward = get_referral_reward()
     return InlineKeyboardMarkup([
         [InlineKeyboardButton(status, callback_data="admin_status")],
         [
@@ -702,6 +756,20 @@ def admin_keyboard():
                 "📱 شماره‌های اشتراک‌گذاری‌شده",
                 callback_data="admin_phones"
             )
+        ],
+        [
+            InlineKeyboardButton(
+                f"🎁 پاداش زیرمجموعه: {money(reward)} {CURRENCY}",
+                callback_data="admin_ref_info"
+            )
+        ],
+        [
+            InlineKeyboardButton(
+                "➖ کاهش 0.01", callback_data="admin_ref_dec"
+            ),
+            InlineKeyboardButton(
+                "➕ افزایش 0.01", callback_data="admin_ref_inc"
+            ),
         ],
     ])
 
@@ -726,6 +794,9 @@ async def start(update, context):
                 referrer_id = None
 
             if referrer_id and referrer_id != user.id:
+                reward_amount = get_referral_reward()
+                reward_granted = False
+
                 with closing(get_db()) as db:
                     row = db.execute(
                         "SELECT referrer_id FROM users WHERE user_id = ?",
@@ -758,41 +829,43 @@ async def start(update, context):
                             """, (
                                 referrer_id,
                                 user.id,
-                                str(REFERRAL_REWARD)
+                                str(reward_amount)
                             ))
                             db.commit()
+                            reward_granted = True
 
-                            try:
-                                change_balance(
-                                    referrer_id,
-                                    REFERRAL_REWARD,
-                                    "referral",
-                                    f"Referral {user.id}"
-                                )
-                            except Exception:
-                                logger.exception("Referral reward failed")
+                if reward_granted:
+                    try:
+                        change_balance(
+                            referrer_id,
+                            reward_amount,
+                            "referral",
+                            f"Referral {user.id}"
+                        )
+                    except Exception:
+                        logger.exception("Referral reward failed")
 
-                            try:
-                                new_bal = get_balance(referrer_id)
-                                ref_name = (
-                                    user.first_name
-                                    or (f"@{user.username}" if user.username else str(user.id))
-                                )
-                                await safe_send_message(
-                                    context.bot,
-                                    referrer_id,
-                                    "🎁 <b>زیرمجموعه جدید!</b>\n\n"
-                                    f"👤 {ref_name} به زیرمجموعه‌های شما اضافه شد.\n\n"
-                                    f"💰 پاداش: <b>{money(REFERRAL_REWARD)} {CURRENCY}</b>\n"
-                                    f"💳 موجودی جدید: "
-                                    f"<b>{money(new_bal)} {CURRENCY}</b>",
-                                    parse_mode="HTML",
-                                )
-                            except Exception:
-                                logger.warning(
-                                    "Referral PV notify failed for %s",
-                                    referrer_id
-                                )
+                    try:
+                        new_bal = get_balance(referrer_id)
+                        ref_name = safe_name(
+                            user.first_name
+                            or (f"@{user.username}" if user.username else str(user.id))
+                        )
+                        await safe_send_message(
+                            context.bot,
+                            referrer_id,
+                            "🎁 <b>زیرمجموعه جدید!</b>\n\n"
+                            f"👤 {ref_name} به زیرمجموعه‌های شما اضافه شد.\n\n"
+                            f"💰 پاداش: <b>{money(reward_amount)} {CURRENCY}</b>\n"
+                            f"💳 موجودی جدید: "
+                            f"<b>{money(new_bal)} {CURRENCY}</b>",
+                            parse_mode="HTML",
+                        )
+                    except Exception:
+                        logger.warning(
+                            "Referral PV notify failed for %s",
+                            referrer_id
+                        )
 
     # مرحله ۱: شماره
     if not is_owner(user.id) and not user_has_phone(user.id):
@@ -851,8 +924,8 @@ async def show_my_id(update, context, show_keyboard=True):
         "🆔 آیدی عددی شما\n\n"
         f"<code>{user.id}</code>\n\n"
         "این آیدی رو می‌تونی به دوستات بدی تا\n"
-        "بدون ریپلای، برات DOGS بفرستن:\n"
-        f"<code>انتقال 50 {user.id}</code>"
+        "بدون ریپلای، برات TRX بفرستن:\n"
+        f"<code>انتقال 0.5 {user.id}</code>"
     )
 
     markup = main_keyboard() if show_keyboard else None
@@ -900,12 +973,13 @@ async def show_referral(update, context, show_keyboard=True):
         """, (user.id,)).fetchone()
 
     total = row["total"] if row else 0
+    reward = get_referral_reward()
 
     text = (
         "👥 زیرمجموعه\n\n"
         f"🔗 لینک دعوت:\n{link}\n\n"
         f"👤 تعداد: {total}\n"
-        f"🎁 پاداش هر نفر: {money(REFERRAL_REWARD)} {CURRENCY}"
+        f"🎁 پاداش هر نفر: {money(reward)} {CURRENCY}"
     )
 
     markup = main_keyboard() if show_keyboard else None
@@ -926,29 +1000,28 @@ async def show_referral(update, context, show_keyboard=True):
 # ============================================================
 
 async def show_help(update, context, show_keyboard=True):
+    reward = get_referral_reward()
     text = (
         "📚 راهنمای BET_BT\n\n"
         "💰 موجودی\n"
         "بنویس: موجودی یا م\n\n"
         "👥 زیرمجموعه\n"
-        f"🎁 پاداش هر نفر: {money(REFERRAL_REWARD)} {CURRENCY}\n\n"
-        "🏧 برداشت DOGS\n"
+        f"🎁 پاداش هر نفر: {money(reward)} {CURRENCY}\n\n"
+        "🏧 برداشت TRX\n"
         f"حداقل برداشت: {money(MIN_WITHDRAWAL)} {CURRENCY}\n"
-        "فرمت:\n"
-        "برداشت <مبلغ> <آدرس ولت>\n"
-        "مثال:\n"
-        "برداشت 2500 UQxxxxxxxxxxxxxxxxxxxx\n\n"
+        "روی دکمه «🏧 برداشت TRX» بزن و مراحل رو جلو برو.\n"
+        "آدرس ولت TRX باید با T شروع بشه و 34 کاراکتر باشه.\n\n"
         "📱 اشتراک شماره\n"
         "فقط شماره‌های +98 قبول می‌شوند.\n\n"
         "🔄 انتقال در گپ:\n"
         "روش ۱ — ریپلای روی پیام کاربر:\n"
-        "انتقال 50\n\n"
+        "انتقال 0.5\n\n"
         "روش ۲ — با آیدی عددی:\n"
-        "انتقال 50 123456789\n"
+        "انتقال 0.5 123456789\n"
         "✅ حتی اگه طرف ربات رو استارت نکرده باشه\n\n"
         "🎮 بازی (فقط در گپ GAP_BAZIN1):\n"
         "فرمت: <تعداد> <نوع> <شرط>\n"
-        "مثال: 3 تاس 50\n\n"
+        "مثال: 3 تاس 0.5\n\n"
         f"• حداقل شرط: {money(MIN_GAME_BET)} {CURRENCY}\n"
         f"• حداکثر شرط: {money(MAX_GAME_BET)} {CURRENCY}\n"
         f"• حداکثر تعداد پرتاب: {MAX_GAME_COUNT}\n\n"
@@ -985,7 +1058,7 @@ async def show_phone_request(update, context):
     if saved:
         text = (
             "📱 شماره شما ثبت شده است\n\n"
-            f"📞 <code>{saved}</code>\n\n"
+            f"📞 <code>{safe_name(saved)}</code>\n\n"
             "اگر می‌خواهید شماره دیگری ثبت کنید، روی دکمه زیر بزنید."
         )
     else:
@@ -1057,7 +1130,7 @@ async def contact_handler(update, context):
         await message.reply_text(
             "❌ <b>شماره شما قبول نشد.</b>\n\n"
             "فقط شماره‌های با پیش‌شماره <b>+98</b> پذیرفته می‌شوند.\n"
-            f"📞 شماره دریافتی: <code>{phone_raw}</code>\n\n"
+            f"📞 شماره دریافتی: <code>{safe_name(phone_raw)}</code>\n\n"
             "لطفاً با شماره ایران (+98) دوباره تلاش کنید.",
             parse_mode="HTML",
             reply_markup=phone_request_keyboard()
@@ -1084,7 +1157,7 @@ async def contact_handler(update, context):
 
     await message.reply_text(
         "✅ <b>شماره شما با موفقیت ثبت شد.</b>\n\n"
-        f"📞 شماره: <code>{phone_norm}</code>",
+        f"📞 شماره: <code>{safe_name(phone_norm)}</code>",
         parse_mode="HTML",
         reply_markup=ReplyKeyboardRemove()
     )
@@ -1095,10 +1168,10 @@ async def contact_handler(update, context):
                 context.bot,
                 owner,
                 "📱 <b>شماره جدید ثبت شد</b>\n\n"
-                f"👤 نام: {user.first_name or '-'}\n"
-                f"🔗 یوزر: @{user.username or '-'}\n"
+                f"👤 نام: {safe_name(user.first_name or '-')}\n"
+                f"🔗 یوزر: @{safe_name(user.username or '-')}\n"
                 f"🆔 آیدی: <code>{user.id}</code>\n"
-                f"📞 شماره: <code>{phone_norm}</code>",
+                f"📞 شماره: <code>{safe_name(phone_norm)}</code>",
                 parse_mode="HTML",
             )
         except Exception:
@@ -1125,7 +1198,7 @@ async def transfer(update, context, amount):
     if not message.reply_to_message:
         await message.reply_text(
             "❌ برای انتقال باید روی پیام کاربر Reply کنید.\n\n"
-            "مثال:\nانتقال 50"
+            "مثال:\nانتقال 0.5"
         )
         return
 
@@ -1211,7 +1284,7 @@ async def transfer(update, context, amount):
     await message.reply_text(
         "✅ انتقال انجام شد.\n\n"
         f"💸 مبلغ: {money(amount)} {CURRENCY}\n"
-        f"👤 گیرنده: {target.first_name or target.id}\n"
+        f"👤 گیرنده: {safe_name(target.first_name or target.id)}\n"
         f"💰 موجودی شما: {money(get_balance(user.id))} {CURRENCY}"
     )
 
@@ -1306,7 +1379,7 @@ async def transfer_by_id(update, context, amount, target_id):
         await message.reply_text("❌ انتقال انجام نشد.")
         return
 
-    target_name = get_user_display_name(target_id)
+    target_name = safe_name(get_user_display_name(target_id))
 
     await message.reply_text(
         "✅ انتقال انجام شد.\n\n"
@@ -1321,7 +1394,7 @@ async def transfer_by_id(update, context, amount, target_id):
             context.bot,
             target_id,
             "💸 انتقال دریافت کردید!\n\n"
-            f"👤 از: {user.first_name or user.id}\n"
+            f"👤 از: {safe_name(user.first_name or user.id)}\n"
             f"💰 مبلغ: {money(amount)} {CURRENCY}\n"
             f"💰 موجودی: "
             f"{money(get_balance(target_id))} {CURRENCY}",
@@ -1335,67 +1408,140 @@ async def transfer_by_id(update, context, amount, target_id):
 
 
 # ============================================================
-# WITHDRAW
+# WITHDRAW  (فلو کیبوردی مرحله‌ای)
 # ============================================================
 
 async def show_withdraw_info(update, context, show_keyboard=True):
+    """شروع فلو برداشت — مرحله اول: درخواست مبلغ"""
     user = update.effective_user
     ensure_user(user)
 
-    text = (
-        "🏧 برداشت DOGS\n\n"
-        f"💰 موجودی شما: {money(get_balance(user.id))} {CURRENCY}\n"
-        f"📉 حداقل برداشت: {money(MIN_WITHDRAWAL)} {CURRENCY}\n\n"
-        "📝 فرمت:\n"
-        "برداشت <مبلغ> <آدرس ولت>\n\n"
-        "مثال:\n"
-        "برداشت 2500 UQxxxxxxxxxxxxxxxxxxxx\n\n"
-        "⏳ پس از ثبت، درخواست برای تأیید به مدیریت ارسال می‌شود."
-    )
+    balance = get_balance(user.id)
 
-    markup = main_keyboard() if show_keyboard else None
+    if balance < MIN_WITHDRAWAL:
+        text = (
+            "🏧 برداشت TRX\n\n"
+            f"💰 موجودی شما: {money(balance)} {CURRENCY}\n"
+            f"📉 حداقل برداشت: {money(MIN_WITHDRAWAL)} {CURRENCY}\n\n"
+            "❌ موجودی شما برای برداشت کافی نیست."
+        )
+        if update.callback_query:
+            try:
+                await update.callback_query.edit_message_text(
+                    text, reply_markup=main_keyboard()
+                )
+            except Exception:
+                pass
+        else:
+            await update.message.reply_text(
+                text, reply_markup=main_keyboard()
+            )
+        return
+
+    # شروع مرحله برداشت
+    context.user_data["withdraw_step"] = "amount"
+    context.user_data.pop("withdraw_amount", None)
+
+    text = (
+        "🏧 برداشت TRX\n\n"
+        f"💰 موجودی شما: {money(balance)} {CURRENCY}\n"
+        f"📉 حداقل برداشت: {money(MIN_WITHDRAWAL)} {CURRENCY}\n\n"
+        "💵 لطفاً <b>مبلغ مورد نظر</b> را به TRX ارسال کنید.\n"
+        "مثال: <code>5</code>"
+    )
 
     if update.callback_query:
         try:
             await update.callback_query.edit_message_text(
-                text, reply_markup=markup
+                text, parse_mode="HTML",
+                reply_markup=cancel_withdraw_keyboard()
             )
         except Exception:
             pass
     else:
         await update.message.reply_text(
-            text, reply_markup=markup
+            text, parse_mode="HTML",
+            reply_markup=cancel_withdraw_keyboard()
         )
 
 
-async def process_withdrawal(update, context, amount, wallet):
-    user = update.effective_user
+async def handle_withdraw_amount(update, context, text):
+    """کاربر مبلغ رو وارد کرده"""
     message = update.message
+    user = update.effective_user
 
-    ensure_user(user)
+    amount = parse_amount(text)
 
-    if amount is None or amount <= 0:
-        await message.reply_text("❌ مبلغ صحیح نیست.")
+    if amount is None:
+        await message.reply_text(
+            "❌ مبلغ وارد شده صحیح نیست.\n"
+            "مثال: <code>5</code>",
+            parse_mode="HTML",
+            reply_markup=cancel_withdraw_keyboard()
+        )
         return
 
     if amount < MIN_WITHDRAWAL:
         await message.reply_text(
-            f"❌ حداقل برداشت {money(MIN_WITHDRAWAL)} {CURRENCY} است."
+            f"❌ حداقل برداشت {money(MIN_WITHDRAWAL)} {CURRENCY} است.",
+            reply_markup=cancel_withdraw_keyboard()
         )
         return
+
+    balance = get_balance(user.id)
+    if amount > balance:
+        await message.reply_text(
+            f"❌ موجودی شما کافی نیست.\n"
+            f"💰 موجودی: {money(balance)} {CURRENCY}",
+            reply_markup=cancel_withdraw_keyboard()
+        )
+        return
+
+    context.user_data["withdraw_step"] = "wallet"
+    context.user_data["withdraw_amount"] = str(amount)
+
+    await message.reply_text(
+        "📮 حالا <b>آدرس ولت TRX</b> خود را ارسال کنید.\n\n"
+        "⚠️ آدرس باید با حرف <b>T</b> شروع شود و ۳۴ کاراکتر باشد.\n"
+        "مثال:\n"
+        "<code>TXYZ...abc</code>",
+        parse_mode="HTML",
+        reply_markup=cancel_withdraw_keyboard()
+    )
+
+
+async def handle_withdraw_wallet(update, context, wallet):
+    """کاربر آدرس ولت رو وارد کرده"""
+    message = update.message
+    user = update.effective_user
 
     wallet = wallet.strip()
 
-    if len(wallet) < 20 or len(wallet) > 128:
+    if not is_valid_trx_address(wallet):
         await message.reply_text(
-            "❌ آدرس ولت باید بین ۲۰ تا ۱۲۸ کاراکتر باشد."
+            "❌ آدرس ولت TRX معتبر نیست.\n"
+            "باید با <b>T</b> شروع شود و ۳۴ کاراکتر باشد.",
+            parse_mode="HTML",
+            reply_markup=cancel_withdraw_keyboard()
         )
         return
 
-    if not re.match(r"^[A-Za-z0-9_\-:]+$", wallet):
-        await message.reply_text("❌ آدرس ولت معتبر نیست.")
+    try:
+        amount = Decimal(context.user_data.get("withdraw_amount", "0"))
+    except Exception:
+        amount = None
+
+    if not amount or amount <= 0:
+        context.user_data.pop("withdraw_step", None)
+        context.user_data.pop("withdraw_amount", None)
+        await message.reply_text("❌ خطا. دوباره تلاش کنید.")
         return
 
+    # پاک کردن state
+    context.user_data.pop("withdraw_step", None)
+    context.user_data.pop("withdraw_amount", None)
+
+    # چک pending
     with closing(get_db()) as db:
         pending = db.execute("""
             SELECT id FROM withdrawals
@@ -1406,36 +1552,38 @@ async def process_withdrawal(update, context, amount, wallet):
     if pending:
         await message.reply_text(
             "❌ شما یک درخواست برداشت در انتظار دارید.\n"
-            "لطفاً تا بررسی آن صبر کنید."
+            "لطفاً تا بررسی آن صبر کنید.",
+            reply_markup=main_keyboard()
         )
         return
 
-    balance = get_balance(user.id)
-
-    if balance < amount:
-        await message.reply_text(
-            f"❌ موجودی کافی نیست.\n"
-            f"💰 موجودی: {money(balance)} {CURRENCY}\n"
-            f"💸 درخواست: {money(amount)} {CURRENCY}"
-        )
-        return
-
+    # کسر از موجودی
     try:
         change_balance(
             user.id, -amount, "withdraw",
-            f"Withdraw {wallet[:20]}"
+            f"Withdraw {wallet[:10]}..."
         )
     except ValueError as e:
         if str(e) == "insufficient_balance":
-            await message.reply_text("❌ موجودی کافی نیست.")
+            await message.reply_text(
+                "❌ موجودی کافی نیست.",
+                reply_markup=main_keyboard()
+            )
         else:
-            await message.reply_text("❌ برداشت انجام نشد.")
+            await message.reply_text(
+                "❌ برداشت انجام نشد.",
+                reply_markup=main_keyboard()
+            )
         return
     except Exception:
         logger.exception("Withdraw deduction failed")
-        await message.reply_text("❌ خطا در برداشت.")
+        await message.reply_text(
+            "❌ خطا در برداشت.",
+            reply_markup=main_keyboard()
+        )
         return
 
+    # ثبت درخواست
     try:
         with closing(get_db()) as db:
             cursor = db.execute("""
@@ -1454,7 +1602,10 @@ async def process_withdrawal(update, context, amount, wallet):
             )
         except Exception:
             logger.exception("Withdraw rollback failed")
-        await message.reply_text("❌ برداشت ثبت نشد.")
+        await message.reply_text(
+            "❌ برداشت ثبت نشد.",
+            reply_markup=main_keyboard()
+        )
         return
 
     short_wallet = (
@@ -1462,17 +1613,19 @@ async def process_withdrawal(update, context, amount, wallet):
         else wallet[:20] + "..." + wallet[-15:]
     )
 
+    # اطلاع به مالک
     for owner in OWNER_IDS:
         try:
             await safe_send_message(
                 context.bot, owner,
-                "🏧 درخواست برداشت جدید\n\n"
-                f"🆔 شماره: {wid}\n"
-                f"👤 نام: {user.first_name or '-'}\n"
-                f"🔗 یوزر: @{user.username or '-'}\n"
-                f"🆔 آیدی: {user.id}\n"
-                f"💰 مبلغ: {money(amount)} {CURRENCY}\n"
-                f"📮 ولت:\n{short_wallet}",
+                "🏧 <b>درخواست برداشت جدید</b>\n\n"
+                f"🆔 شماره: <code>{wid}</code>\n"
+                f"👤 نام: {safe_name(user.first_name or '-')}\n"
+                f"🔗 یوزر: @{safe_name(user.username or '-')}\n"
+                f"🆔 آیدی: <code>{user.id}</code>\n"
+                f"💰 مبلغ: <b>{money(amount)} {CURRENCY}</b>\n"
+                f"📮 ولت:\n<code>{safe_name(short_wallet)}</code>",
+                parse_mode="HTML",
                 reply_markup=InlineKeyboardMarkup([
                     [
                         InlineKeyboardButton(
@@ -1493,8 +1646,10 @@ async def process_withdrawal(update, context, amount, wallet):
         "✅ درخواست برداشت ثبت شد.\n\n"
         f"🆔 شماره: {wid}\n"
         f"💰 مبلغ: {money(amount)} {CURRENCY}\n"
-        f"📮 ولت: {short_wallet}\n\n"
-        "⏳ در انتظار تأیید مدیریت."
+        f"📮 ولت: <code>{safe_name(short_wallet)}</code>\n\n"
+        "⏳ در انتظار تأیید مدیریت.",
+        parse_mode="HTML",
+        reply_markup=main_keyboard()
     )
 
 
@@ -1510,10 +1665,12 @@ async def admin_panel(update, context):
         return
 
     status = "🟢 روشن" if bot_enabled() else "🔴 خاموش"
+    reward = get_referral_reward()
 
     await update.message.reply_text(
         f"👑 پنل مدیریت BET_BT\n\n"
-        f"وضعیت: {status}\n\n"
+        f"وضعیت: {status}\n"
+        f"🎁 پاداش زیرمجموعه: {money(reward)} {CURRENCY}\n\n"
         "➕ شارژ از گپ:\n"
         "روی پیام کاربر Reply کنید:\n"
         "شارژ 100\n\n"
@@ -1685,7 +1842,7 @@ async def admin_change_by_reply(update, context, operation, amount):
 
     await message.reply_text(
         f"✅ {title} انجام شد.\n\n"
-        f"👤 کاربر: {target.first_name or target.id}\n"
+        f"👤 کاربر: {safe_name(target.first_name or target.id)}\n"
         f"🆔 آیدی: {target.id}\n"
         f"💰 مبلغ: {money(amount)} {CURRENCY}\n"
         f"💳 موجودی جدید: {money(new_balance)} {CURRENCY}"
@@ -1816,12 +1973,12 @@ async def admin_list_phones(update, context):
     lines = [f"📱 شماره‌های اشتراک‌گذاری‌شده ({total})\n"]
 
     for r in rows:
-        name = r["first_name"] or "-"
-        uname = f"@{r['username']}" if r["username"] else "-"
+        name = safe_name(r["first_name"] or "-")
+        uname = f"@{safe_name(r['username'])}" if r["username"] else "-"
         lines.append(
             f"👤 {name} | {uname}\n"
             f"🆔 <code>{r['user_id']}</code>\n"
-            f"📞 <code>{r['phone']}</code>\n"
+            f"📞 <code>{safe_name(r['phone'])}</code>\n"
             f"🕐 {r['created_at']}\n"
         )
 
@@ -1909,6 +2066,7 @@ async def withdraw_callback(update, context):
 
             amount = Decimal(wd["amount"])
             wd_user_id = int(wd["user_id"])
+            wd_wallet = wd["wallet"]
 
             if action == "ok":
                 row = db.execute(
@@ -1941,12 +2099,28 @@ async def withdraw_callback(update, context):
                 except Exception:
                     pass
 
+                # ویرایش پیام مالک — حذف دکمه‌های تایید/رد و افزودن دکمه ارسال مدرک
+                try:
+                    await query.edit_message_reply_markup(
+                        reply_markup=InlineKeyboardMarkup([
+                            [InlineKeyboardButton(
+                                "📤 ارسال مدرک پرداخت (عکس/ویس/لینک)",
+                                callback_data=f"wd_proof_{wd_id}"
+                            )]
+                        ])
+                    )
+                except Exception:
+                    pass
+
                 await safe_send_message(
                     context.bot, wd_user_id,
-                    f"✅ درخواست برداشت شما تأیید شد.\n\n"
+                    "✅ <b>درخواست برداشت شما تأیید شد.</b>\n\n"
                     f"🆔 شماره: {wd_id}\n"
                     f"💰 مبلغ: {money(amount)} {CURRENCY}\n"
-                    "📮 مبلغ به آدرس ثبت‌شده ارسال می‌شود."
+                    f"📮 ولت: <code>{safe_name(wd_wallet)}</code>\n\n"
+                    "⏳ مبلغ به آدرس شما ارسال خواهد شد.\n"
+                    "مدرک پرداخت نیز برایتان ارسال می‌شود.",
+                    parse_mode="HTML"
                 )
             else:
                 db.execute("""
@@ -1990,12 +2164,20 @@ async def withdraw_callback(update, context):
                 except Exception:
                     pass
 
+                try:
+                    await query.edit_message_reply_markup(
+                        reply_markup=None
+                    )
+                except Exception:
+                    pass
+
                 await safe_send_message(
                     context.bot, wd_user_id,
-                    f"❌ درخواست برداشت شما رد شد.\n\n"
+                    f"❌ <b>درخواست برداشت شما رد شد.</b>\n\n"
                     f"🆔 شماره: {wd_id}\n"
                     f"💰 مبلغ: {money(amount)} {CURRENCY}\n"
-                    "💳 مبلغ به موجودی شما برگشت داده شد."
+                    "💳 مبلغ به موجودی شما برگشت داده شد.",
+                    parse_mode="HTML"
                 )
 
         except Exception:
@@ -2007,6 +2189,99 @@ async def withdraw_callback(update, context):
                 )
             except Exception:
                 pass
+
+
+async def wd_proof_callback(update, context):
+    """مالک روی دکمه ارسال مدرک زده — منتظر دریافت عکس/ویس/لینک از مالک می‌مونیم"""
+    query = update.callback_query
+    user = query.from_user
+
+    if not is_owner(user.id):
+        try:
+            await query.answer("❌ دسترسی ندارید.", show_alert=True)
+        except Exception:
+            pass
+        return
+
+    try:
+        wd_id = int(query.data.replace("wd_proof_", ""))
+    except Exception:
+        return
+
+    with closing(get_db()) as db:
+        wd = db.execute(
+            "SELECT * FROM withdrawals WHERE id = ?",
+            (wd_id,)
+        ).fetchone()
+
+    if not wd or wd["status"] != "approved":
+        try:
+            await query.answer(
+                "❌ این درخواست تأیید نشده.", show_alert=True
+            )
+        except Exception:
+            pass
+        return
+
+    target_id = int(wd["user_id"])
+    PENDING_PROOF[user.id] = target_id
+
+    try:
+        await query.answer("✅ در انتظار دریافت مدرک از شما")
+    except Exception:
+        pass
+
+    await safe_send_message(
+        context.bot,
+        query.message.chat_id,
+        "📤 <b>ارسال مدرک پرداخت</b>\n\n"
+        f"👤 گیرنده: <code>{target_id}</code>\n"
+        f"💰 مبلغ: {money(Decimal(wd['amount']))} {CURRENCY}\n\n"
+        "حالا هر پیام (متن، عکس، ویس، ویدیو، سند یا لینک) که بفرستی،\n"
+        "مستقیم برای کاربر فوروارد می‌شود.\n\n"
+        "برای لغو: <code>لغو مدرک</code>",
+        parse_mode="HTML"
+    )
+
+
+async def owner_proof_handler(update, context):
+    """فوروارد هر پیام مالک (متن/عکس/ویس/ویدیو/سند) به کاربر هدف"""
+    user = update.effective_user
+    message = update.message
+
+    if not user or not message:
+        return
+    if not is_owner(user.id):
+        return
+    if user.id not in PENDING_PROOF:
+        return
+    if message.chat.type != ChatType.PRIVATE:
+        return
+
+    # امکان لغو
+    if message.text and message.text.strip() == "لغو مدرک":
+        target = PENDING_PROOF.pop(user.id, None)
+        await message.reply_text(
+            f"❌ ارسال مدرک لغو شد.\n(گیرنده: {target})"
+        )
+        return
+
+    target_id = PENDING_PROOF[user.id]
+
+    try:
+        await message.copy(chat_id=target_id)
+        await message.reply_text(
+            f"✅ مدرک پرداخت برای کاربر <code>{target_id}</code> ارسال شد.\n\n"
+            "برای ارسال مدرک دیگر، دوباره از پنل اقدام کن یا همین‌جا بفرست.\n"
+            "برای لغو: <code>لغو مدرک</code>",
+            parse_mode="HTML"
+        )
+    except Exception:
+        logger.exception("Proof forward failed")
+        await message.reply_text(
+            "❌ ارسال ناموفق بود. ممکنه کاربر ربات رو بلاک کرده باشه."
+        )
+        PENDING_PROOF.pop(user.id, None)
 
 
 # ============================================================
@@ -2081,6 +2356,53 @@ async def admin_callback(update, context):
         await admin_list_phones(update, context)
         return
 
+    if data == "admin_ref_info":
+        reward = get_referral_reward()
+        try:
+            await query.answer(
+                f"🎁 پاداش فعلی: {money(reward)} {CURRENCY}",
+                show_alert=True
+            )
+        except Exception:
+            pass
+        return
+
+    if data == "admin_ref_inc":
+        new_reward = get_referral_reward() + Decimal("0.01")
+        set_referral_reward(new_reward)
+        try:
+            await query.answer(
+                f"✅ پاداش افزایش یافت: {money(new_reward)} {CURRENCY}"
+            )
+        except Exception:
+            pass
+        try:
+            await query.edit_message_reply_markup(
+                reply_markup=admin_keyboard()
+            )
+        except Exception:
+            pass
+        return
+
+    if data == "admin_ref_dec":
+        new_reward = get_referral_reward() - Decimal("0.01")
+        if new_reward < Decimal("0"):
+            new_reward = Decimal("0")
+        set_referral_reward(new_reward)
+        try:
+            await query.answer(
+                f"✅ پاداش کاهش یافت: {money(new_reward)} {CURRENCY}"
+            )
+        except Exception:
+            pass
+        try:
+            await query.edit_message_reply_markup(
+                reply_markup=admin_keyboard()
+            )
+        except Exception:
+            pass
+        return
+
     if data == "admin_back":
         try:
             await query.edit_message_text(
@@ -2120,6 +2442,7 @@ async def admin_callback(update, context):
             ).fetchone()["c"]
 
         total = float(total_row["total"] or 0)
+        reward = get_referral_reward()
 
         try:
             await query.answer()
@@ -2130,8 +2453,9 @@ async def admin_callback(update, context):
             await query.edit_message_text(
                 "📊 آمار BET_BT\n\n"
                 f"👤 کاربران: {users}\n"
-                f"💰 مجموع موجودی: {total:.2f} {CURRENCY}\n"
+                f"💰 مجموع موجودی: {total:.4f} {CURRENCY}\n"
                 f"👥 زیرمجموعه‌ها: {referrals}\n"
+                f"🎁 پاداش زیرمجموعه: {money(reward)} {CURRENCY}\n"
                 f"🎮 بازی‌ها: {games}\n"
                 f"📱 شماره‌ها: {phones}\n"
                 f"🏧 برداشت در انتظار: {pending_wd}\n\n"
@@ -2171,10 +2495,20 @@ async def user_callback(update, context):
         await show_my_id(update, context, show_keyboard=True)
     elif query.data == "user_phone":
         await show_phone_request(update, context)
+    elif query.data == "wd_cancel":
+        context.user_data.pop("withdraw_step", None)
+        context.user_data.pop("withdraw_amount", None)
+        try:
+            await query.edit_message_text(
+                "❌ برداشت لغو شد.",
+                reply_markup=main_keyboard()
+            )
+        except Exception:
+            pass
 
 
 # ============================================================
-# GAME CONFIG (با بسکتبال)
+# GAME CONFIG
 # ============================================================
 
 GAME_INFO = {
@@ -2234,7 +2568,6 @@ def parse_game(text):
 
 
 def get_active_game_for_user(chat_id, user_id):
-    """✅ همه وضعیت‌های فعال رو چک می‌کنه"""
     with closing(get_db()) as db:
         row = db.execute("""
             SELECT * FROM games
@@ -2262,14 +2595,12 @@ def get_game(game_id):
 # ============================================================
 
 def dice_to_points(game_type, dice_value):
-    """بسکتبال: 4 یا 5 = گل (1 امتیاز)، 1-3 = اوت (0)"""
     if game_type == "basketball":
         return 1 if int(dice_value) >= 4 else 0
     return int(dice_value)
 
 
 def format_score(game_type, score):
-    """برای بسکتبال، تعداد گل رو نشون بده"""
     if game_type == "basketball":
         return f"{score} گل"
     return str(score)
@@ -2375,7 +2706,7 @@ async def create_game(update, context, count, game_type, bet):
         f"{emoji} {name}\n"
         f"🔢 تعداد: {count}\n"
         f"💰 شرط: {money(bet)} {CURRENCY}\n"
-        f"👤 سازنده: {user.first_name or user.id}\n\n"
+        f"👤 سازنده: {safe_name(user.first_name or user.id)}\n\n"
         "یکی از گزینه‌ها را انتخاب کنید.",
         reply_markup=keyboard
     )
@@ -2397,10 +2728,11 @@ async def join_game_callback(update, context):
     query = update.callback_query
     user = query.from_user
 
-    if not await check_membership(user.id, context):
+    # ✅ چک شماره و عضویت
+    if not await require_phone_and_membership(update, context):
         try:
             await query.answer(
-                "❌ ابتدا عضو کانال و گپ شوید.",
+                "❌ ابتدا شماره ثبت و عضو کانال/گپ شوید.",
                 show_alert=True
             )
         except Exception:
@@ -2543,10 +2875,10 @@ async def bot_game_callback(update, context):
     query = update.callback_query
     user = query.from_user
 
-    if not await check_membership(user.id, context):
+    if not await require_phone_and_membership(update, context):
         try:
             await query.answer(
-                "❌ ابتدا عضو کانال و گپ شوید.",
+                "❌ ابتدا شماره ثبت و عضو کانال/گپ شوید.",
                 show_alert=True
             )
         except Exception:
@@ -2776,6 +3108,10 @@ async def user_game_dice_handler(update, context):
         if not is_creator:
             return
 
+        new_rolls = 0
+        count = int(game["count"])
+        mode = game["mode"]
+
         with closing(get_db()) as db:
             try:
                 db.execute("BEGIN IMMEDIATE")
@@ -2827,14 +3163,14 @@ async def user_game_dice_handler(update, context):
                 logger.exception("Creator dice processing failed")
                 return
 
-        if game["mode"] == "bot" and new_rolls >= int(game["count"]):
+        if mode == "bot" and new_rolls >= count:
             bot_total = await bot_roll_game(context, game["id"])
 
             if bot_total is not None:
                 await finish_game(context, game["id"])
             return
 
-        if game["mode"] == "friends" and new_rolls >= int(game["count"]):
+        if mode == "friends" and new_rolls >= count:
             fresh = get_game(game["id"])
             if not fresh:
                 return
@@ -2857,6 +3193,9 @@ async def user_game_dice_handler(update, context):
     if game["status"] == "opponent_turn":
         if not is_opponent:
             return
+
+        new_rolls = 0
+        count = int(game["count"])
 
         with closing(get_db()) as db:
             try:
@@ -2906,7 +3245,7 @@ async def user_game_dice_handler(update, context):
                 logger.exception("Opponent dice processing failed")
                 return
 
-        if new_rolls >= int(game["count"]):
+        if new_rolls >= count:
             await finish_game(context, game["id"])
 
 
@@ -2985,6 +3324,22 @@ async def bot_roll_game(context, game_id):
 # ============================================================
 
 async def finish_game(context, game_id):
+    # ✅ استخراج همه مقادیر لازم داخل بلاک و commit قبل از استفاده
+    chat_id = None
+    game_type = None
+    creator_id = None
+    opponent_id = None
+    mode = None
+    bet = Decimal("0")
+    creator_total = 0
+    opponent_total = 0
+    result_type = None
+    winner_id = None
+    loser_id = None
+    payout_value = Decimal("0")
+    commission_value = Decimal("0")
+    refund_value = Decimal("0")
+
     with closing(get_db()) as db:
         try:
             db.execute("BEGIN IMMEDIATE")
@@ -2997,7 +3352,6 @@ async def finish_game(context, game_id):
                 db.rollback()
                 return
 
-            # ✅ فقط finishing قابل اتمام است
             if game["status"] != "finishing":
                 db.rollback()
                 return
@@ -3009,30 +3363,25 @@ async def finish_game(context, game_id):
                 WHERE id = ? AND status = 'finishing'
             """, (game_id,))
 
-            # ✅ rowcount به جای total_changes
             if cursor.rowcount != 1:
                 db.rollback()
                 return
 
-            creator_total = int(game["creator_total"])
-            opponent_total = int(game["opponent_total"])
-            bet = Decimal(game["bet"])
+            # ✅ استخراج همه اطلاعات قبل از commit
+            chat_id = game["chat_id"]
+            game_type = game["game_type"]
             creator_id = int(game["creator_id"])
             opponent_id = game["opponent_id"]
             mode = game["mode"]
+            bet = Decimal(game["bet"])
+            creator_total = int(game["creator_total"])
+            opponent_total = int(game["opponent_total"])
 
             pool = bet * 2
             payout = (bet * WIN_MULTIPLIER).quantize(
                 Decimal("0.00000001")
             )
             commission = pool - payout
-
-            result_type = None
-            winner_id = None
-            loser_id = None
-            payout_value = Decimal("0")
-            commission_value = Decimal("0")
-            refund_value = Decimal("0")
 
             def credit(uid, amt, ttype, desc):
                 row = db.execute(
@@ -3053,7 +3402,6 @@ async def finish_game(context, game_id):
                 old_balance = Decimal(row["balance"])
                 new_balance = old_balance + amt
 
-                # ✅ لاگ برای دیباگ
                 logger.info(
                     "BALANCE uid=%s amt=%s type=%s old=%s new=%s",
                     uid, amt, ttype, old_balance, new_balance
@@ -3071,26 +3419,19 @@ async def finish_game(context, game_id):
                 """, (uid, ttype, str(amt), desc))
 
             if mode == "bot":
-                # ⚠️ در بازی با ربات، کمیسیون به مالک داده نمی‌شود
-                # تا اگه خود مالک ببازه، باختش واقعاً کسر بشه
                 if creator_total == opponent_total:
                     credit(creator_id, bet, "game_draw_refund",
                            f"Bot draw {game_id}")
                     result_type = "bot_draw"
                     refund_value = bet
-
                 elif creator_total > opponent_total:
                     credit(creator_id, payout, "game_win",
                            f"Bot game win {game_id}")
                     result_type = "bot_user_win"
                     winner_id = creator_id
                     payout_value = payout
-                    # ⚠️ هیچ کمیسیونی به مالک داده نمی‌شود
-
                 else:
-                    # ربات برد - شرط کاربر قبلاً کسر شده
                     result_type = "bot_bot_win"
-                    # ⚠️ هیچ کمیسیونی به مالک داده نمی‌شود
                     logger.info(
                         "BOT WON vs %s game=%s bet=%s",
                         creator_id, game_id, bet
@@ -3146,11 +3487,11 @@ async def finish_game(context, game_id):
             logger.exception("Finish game failed")
             return
 
-    chat_id = game["chat_id"]
-    emoji, name = GAME_INFO[game["game_type"]]
+    # ✅ از این به بعد فقط از متغیرهای استخراج‌شده استفاده می‌کنیم
+    emoji, name = GAME_INFO[game_type]
 
-    creator_display = format_score(game["game_type"], creator_total)
-    opponent_display = format_score(game["game_type"], opponent_total)
+    creator_display = format_score(game_type, creator_total)
+    opponent_display = format_score(game_type, opponent_total)
 
     creator_tag = user_tag(creator_id)
 
@@ -3172,24 +3513,17 @@ async def finish_game(context, game_id):
             parse_mode="HTML"
         )
 
-        if mode == "bot":
+        await send_pv_result(
+            context, creator_id, name,
+            "🤝 مساوی شدی!",
+            f"💰 {money(refund_value)} {CURRENCY} برگشت."
+        )
+        if mode == "friends" and opponent_id and int(opponent_id) > 0:
             await send_pv_result(
-                context, creator_id, name,
+                context, int(opponent_id), name,
                 "🤝 مساوی شدی!",
                 f"💰 {money(refund_value)} {CURRENCY} برگشت."
             )
-        else:
-            await send_pv_result(
-                context, creator_id, name,
-                "🤝 مساوی شدی!",
-                f"💰 {money(refund_value)} {CURRENCY} برگشت."
-            )
-            if opponent_id and int(opponent_id) > 0:
-                await send_pv_result(
-                    context, int(opponent_id), name,
-                    "🤝 مساوی شدی!",
-                    f"💰 {money(refund_value)} {CURRENCY} برگشت."
-                )
         return
 
     if result_type == "bot_bot_win":
@@ -3269,7 +3603,7 @@ async def finish_game(context, game_id):
 async def send_pv_result(context, user_id, game_name, header, detail):
     text = (
         f"{header}\n\n"
-        f"🎮 بازی: {game_name}\n"
+        f"🎮 بازی: {safe_name(game_name)}\n"
         f"{detail}\n\n"
         f"💰 موجودی: {money(get_balance(user_id))} {CURRENCY}"
     )
@@ -3501,6 +3835,19 @@ async def text_handler(update, context):
     text = normalize_digits(raw_text).strip()
 
     # ========================================================
+    # WITHDRAW FLOW (اول از همه)
+    # ========================================================
+    step = context.user_data.get("withdraw_step")
+
+    if step == "amount":
+        await handle_withdraw_amount(update, context, text)
+        return
+
+    if step == "wallet":
+        await handle_withdraw_wallet(update, context, text)
+        return
+
+    # ========================================================
     # ADMIN INPUT
     # ========================================================
     if is_owner(user.id):
@@ -3551,7 +3898,7 @@ async def text_handler(update, context):
         return
 
     # ========================================================
-    # BALANCE — بدون کیبورد
+    # BALANCE
     # ========================================================
     if text in (
         "موجودی", "م", "موجودی من", "موجودی‌من", "balance"
@@ -3560,14 +3907,14 @@ async def text_handler(update, context):
         return
 
     # ========================================================
-    # MY ID — بدون کیبورد
+    # MY ID
     # ========================================================
     if text in ("آیدی", "ایدی", "myid", "id"):
         await show_my_id(update, context, show_keyboard=False)
         return
 
     # ========================================================
-    # REFERRAL — بدون کیبورد
+    # REFERRAL
     # ========================================================
     if text in (
         "زیر مجموعه", "زیرمجموعه", "زیر‌مجموعه",
@@ -3587,29 +3934,10 @@ async def text_handler(update, context):
         return
 
     # ========================================================
-    # WITHDRAW
+    # WITHDRAW (شروع با دستور متنی)
     # ========================================================
-    if text.startswith("برداشت"):
-        match = re.match(
-            r"^برداشت\s+([0-9]+(?:\.[0-9]+)?)\s+(\S+)$", text
-        )
-
-        if not match:
-            await message.reply_text(
-                "❌ فرمت صحیح:\n\n"
-                "برداشت <مبلغ> <آدرس ولت>\n\n"
-                f"حداقل: {money(MIN_WITHDRAWAL)} {CURRENCY}\n\n"
-                "مثال:\n"
-                "برداشت 2500 UQxxxxxxxxxxxxxxxxxxxx"
-            )
-            return
-
-        amount = parse_amount(match.group(1))
-        wallet = match.group(2).strip()
-
-        await process_withdrawal(
-            update, context, amount, wallet
-        )
+    if text == "برداشت":
+        await show_withdraw_info(update, context, show_keyboard=False)
         return
 
     # ========================================================
@@ -3645,9 +3973,9 @@ async def text_handler(update, context):
         await message.reply_text(
             "❌ فرمت صحیح:\n\n"
             "1️⃣ با ریپلای:\n"
-            "انتقال 50\n\n"
+            "انتقال 0.5\n\n"
             "2️⃣ با آیدی عددی:\n"
-            "انتقال 50 123456789\n\n"
+            "انتقال 0.5 123456789\n\n"
             "⚠️ آیدی خودت رو از دکمه «🆔 آیدی من» بگیر."
         )
         return
@@ -3660,7 +3988,7 @@ async def text_handler(update, context):
     if game == "count_too_high":
         await message.reply_text(
             f"❌ حداکثر تعداد پرتاب {MAX_GAME_COUNT} است.\n\n"
-            "مثال:\n3 تاس 50"
+            "مثال:\n3 تاس 0.5"
         )
         return
 
@@ -3772,7 +4100,7 @@ def main():
 
     application.add_handler(CallbackQueryHandler(
         admin_callback,
-        pattern=r"^admin_(on|off|charge|remove|stats|status|withdrawals|back|phones)$"
+        pattern=r"^admin_(on|off|charge|remove|stats|status|withdrawals|back|phones|ref_info|ref_inc|ref_dec)$"
     ))
 
     application.add_handler(CallbackQueryHandler(
@@ -3781,8 +4109,13 @@ def main():
     ))
 
     application.add_handler(CallbackQueryHandler(
+        wd_proof_callback,
+        pattern=r"^wd_proof_\d+$"
+    ))
+
+    application.add_handler(CallbackQueryHandler(
         user_callback,
-        pattern=r"^user_(balance|ref|help|withdraw|myid|phone)$"
+        pattern=r"^user_(balance|ref|help|withdraw|myid|phone)$|^wd_cancel$"
     ))
 
     application.add_handler(CallbackQueryHandler(
@@ -3801,9 +4134,22 @@ def main():
         contact_handler
     ))
 
+    # Dice handler (قبل از proof handler چون dice هم پیامه)
     application.add_handler(MessageHandler(
         filters.Dice.ALL,
         user_game_dice_handler
+    ))
+
+    # مالک مدرک می‌فرسته (متن/عکس/ویس/ویدیو/سند)
+    application.add_handler(MessageHandler(
+        (
+            filters.PHOTO
+            | filters.VOICE
+            | filters.VIDEO
+            | filters.Document.ALL
+            | filters.AUDIO
+        ) & filters.ChatType.PRIVATE,
+        owner_proof_handler
     ))
 
     application.add_handler(MessageHandler(
