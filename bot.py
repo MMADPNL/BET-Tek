@@ -1,5 +1,6 @@
 import os
 import re
+import random
 import sqlite3
 import logging
 import asyncio
@@ -48,7 +49,7 @@ DB_FILE = "bot.db"
 CURRENCY = "TRX"
 
 MIN_GAME_BET = Decimal("0.1")
-MAX_GAME_BET = None          # ✅ بدون سقف
+MAX_GAME_BET = None
 MAX_GAME_COUNT = 3
 
 DEFAULT_REFERRAL_REWARD = Decimal("0.05")
@@ -60,6 +61,7 @@ WIN_MULTIPLIER = Decimal("1.8")
 GAME_TIMEOUT_MINUTES = 30
 
 PENDING_PROOF: dict = {}
+PENDING_CAPTCHA: dict = {}
 
 # ============================================================
 # LOGGING
@@ -93,6 +95,7 @@ def init_db():
                 first_name TEXT DEFAULT '',
                 balance TEXT NOT NULL DEFAULT '0',
                 referrer_id INTEGER DEFAULT NULL,
+                captcha_verified INTEGER DEFAULT 0,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
         """)
@@ -153,13 +156,19 @@ def init_db():
                 processed_by INTEGER DEFAULT NULL
             )
         """)
-        db.execute("""
-            CREATE TABLE IF NOT EXISTS phone_numbers (
-                user_id INTEGER PRIMARY KEY,
-                phone TEXT NOT NULL,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            )
-        """)
+
+        # migration: captcha_verified column
+        user_columns = {
+            row["name"]
+            for row in db.execute("PRAGMA table_info(users)").fetchall()
+        }
+        if "captcha_verified" not in user_columns:
+            try:
+                db.execute(
+                    "ALTER TABLE users ADD COLUMN captcha_verified INTEGER DEFAULT 0"
+                )
+            except Exception:
+                logger.exception("Migration captcha_verified failed")
 
         columns = {
             row["name"]
@@ -230,23 +239,6 @@ def is_owner(user_id):
         return False
 
 
-def is_valid_iran_phone(phone):
-    if not phone:
-        return False
-    p = normalize_digits(str(phone)).strip()
-    p = p.replace(" ", "").replace("-", "").replace("(", "").replace(")", "")
-    if not p.startswith("+98"):
-        return False
-    digits = p[1:]
-    if not digits.isdigit():
-        return False
-    if len(digits) != 12:
-        return False
-    if not digits.startswith("98"):
-        return False
-    return True
-
-
 def is_valid_trx_address(addr):
     if not addr:
         return False
@@ -310,20 +302,21 @@ def user_tag(user_id):
     return f'<a href="tg://user?id={user_id}">{name}</a>'
 
 
-def user_has_phone(user_id):
+def is_captcha_verified(user_id):
     with closing(get_db()) as db:
         row = db.execute(
-            "SELECT phone FROM phone_numbers WHERE user_id = ?", (user_id,)
+            "SELECT captcha_verified FROM users WHERE user_id = ?", (user_id,)
         ).fetchone()
-    return row is not None
+    return bool(row and row["captcha_verified"] == 1)
 
 
-def get_user_phone(user_id):
+def set_captcha_verified(user_id):
     with closing(get_db()) as db:
-        row = db.execute(
-            "SELECT phone FROM phone_numbers WHERE user_id = ?", (user_id,)
-        ).fetchone()
-    return row["phone"] if row else None
+        db.execute(
+            "UPDATE users SET captcha_verified = 1 WHERE user_id = ?",
+            (user_id,)
+        )
+        db.commit()
 
 
 def get_referral_reward():
@@ -470,7 +463,6 @@ async def check_membership(user_id, context):
 
 
 def join_keyboard():
-    """تنها کیبورد شیشه‌ای که باید بمونه (چون لینک داره)"""
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("📢 عضویت در کانال BET_1XZX", url=CHANNEL_URL)],
         [InlineKeyboardButton("💬 عضویت در گپ GAP_BAZIN1", url=GROUP_URL)],
@@ -507,32 +499,77 @@ async def send_join_required(update, context):
                 pass
 
 
-async def send_phone_prompt(update, context):
+async def send_captcha(update, context):
+    user = update.effective_user
+    if not user:
+        return
+
+    a = random.randint(1, 9)
+    b = random.randint(1, 9)
+    op = random.choice(["+", "-"])
+    if op == "+":
+        answer = a + b
+    else:
+        if a < b:
+            a, b = b, a
+        answer = a - b
+
+    options = {answer}
+    while len(options) < 4:
+        wrong = answer + random.randint(-5, 5)
+        if wrong != answer and wrong >= 0:
+            options.add(wrong)
+    options = list(options)
+    random.shuffle(options)
+
+    PENDING_CAPTCHA[user.id] = {"answer": answer, "options": options}
+
+    buttons = []
+    row = []
+    for idx, opt in enumerate(options):
+        row.append(InlineKeyboardButton(
+            str(opt), callback_data=f"cap_{user.id}_{idx}"
+        ))
+        if len(row) == 2:
+            buttons.append(row)
+            row = []
+    if row:
+        buttons.append(row)
+
     text = (
-        "📱 <b>ثبت شماره</b>\n\n"
-        "برای استفاده از ربات، ابتدا شماره‌ت رو با دکمه زیر ارسال کن.\n\n"
-        "⚠️ فقط شماره‌های با پیش‌شماره <b>+98</b> قبول می‌شوند."
+        "🔐 <b>تأیید امنیتی</b>\n\n"
+        "برای استفاده از ربات، پاسخ صحیح را انتخاب کن:\n\n"
+        f"❓ <b>{a} {op} {b} = ?</b>"
     )
-    if update.message:
-        await safe_send_message(
-            context.bot, update.effective_chat.id, text,
-            parse_mode="HTML", reply_markup=phone_request_keyboard()
-        )
-    elif update.callback_query:
+    keyboard = InlineKeyboardMarkup(buttons)
+
+    if update.callback_query:
+        try:
+            await update.callback_query.edit_message_text(
+                text, parse_mode="HTML", reply_markup=keyboard
+            )
+            return
+        except Exception:
+            pass
         await safe_send_message(
             context.bot, update.callback_query.message.chat_id, text,
-            parse_mode="HTML", reply_markup=phone_request_keyboard()
+            parse_mode="HTML", reply_markup=keyboard
+        )
+    else:
+        await safe_send_message(
+            context.bot, update.effective_chat.id, text,
+            parse_mode="HTML", reply_markup=keyboard
         )
 
 
-async def require_phone_and_membership(update, context):
+async def require_captcha_and_membership(update, context):
     user = update.effective_user
     if not user:
         return False
     if is_owner(user.id):
         return True
-    if not user_has_phone(user.id):
-        await send_phone_prompt(update, context)
+    if not is_captcha_verified(user.id):
+        await send_captcha(update, context)
         return False
     if not await check_membership(user.id, context):
         await send_join_required(update, context)
@@ -550,8 +587,8 @@ async def membership_callback(update, context):
     user = query.from_user
 
     if await check_membership(user.id, context):
-        if not is_owner(user.id) and not user_has_phone(user.id):
-            await send_phone_prompt(update, context)
+        if not is_owner(user.id) and not is_captcha_verified(user.id):
+            await send_captcha(update, context)
             return
         try:
             await query.edit_message_text(
@@ -573,13 +610,86 @@ async def membership_callback(update, context):
             pass
 
 
+async def captcha_callback(update, context):
+    query = update.callback_query
+    user = query.from_user
+
+    try:
+        parts = query.data.split("_")
+        target_uid = int(parts[1])
+        idx = int(parts[2])
+    except Exception:
+        return
+
+    if target_uid != user.id:
+        try:
+            await query.answer("❌ این کپچا برای شما نیست.", show_alert=True)
+        except Exception:
+            pass
+        return
+
+    data = PENDING_CAPTCHA.get(user.id)
+    if not data:
+        try:
+            await query.answer(
+                "❌ کپچا منقضی شده. /start را بزنید.", show_alert=True
+            )
+        except Exception:
+            pass
+        return
+
+    options = data.get("options") or []
+    if idx < 0 or idx >= len(options):
+        return
+
+    if options[idx] != data["answer"]:
+        try:
+            await query.answer(
+                "❌ پاسخ اشتباه! دوباره تلاش کن.", show_alert=True
+            )
+        except Exception:
+            pass
+        return
+
+    PENDING_CAPTCHA.pop(user.id, None)
+    set_captcha_verified(user.id)
+
+    try:
+        await query.answer("✅ تأیید شد")
+    except Exception:
+        pass
+
+    if not is_owner(user.id) and not await check_membership(user.id, context):
+        try:
+            await query.edit_message_text(
+                "✅ تأیید امنیتی انجام شد.\n\n"
+                "🔒 حالا باید در کانال و گپ عضو شوید.",
+                parse_mode="HTML"
+            )
+        except Exception:
+            pass
+        await send_join_required(update, context)
+        return
+
+    try:
+        await query.edit_message_text(
+            "✅ <b>تأیید امنیتی انجام شد.</b>",
+            parse_mode="HTML"
+        )
+    except Exception:
+        pass
+
+    if not is_owner(user.id):
+        await try_grant_referral(user.id, context)
+
+    await send_start_menu(context, query.message.chat_id, user.id)
+
+
 # ============================================================
-# REFERRAL GRANT (فقط بعد از شماره + عضویت)
+# REFERRAL GRANT
 # ============================================================
 
 async def try_grant_referral(user_id, context):
-    """پاداش معرف را فقط زمانی می‌دهد که کاربر شماره داده و عضو کانال/گپ باشد."""
-    # 1) آیا کاربر معرف دارد و قبلاً پرداخت نشده؟
     with closing(get_db()) as db:
         user_row = db.execute(
             "SELECT referrer_id FROM users WHERE user_id = ?", (user_id,)
@@ -594,8 +704,7 @@ async def try_grant_referral(user_id, context):
         if already:
             return
 
-    # 2) شرط‌ها: شماره + عضویت
-    if not user_has_phone(user_id):
+    if not is_captcha_verified(user_id):
         return
     try:
         if not await check_membership(user_id, context):
@@ -605,7 +714,6 @@ async def try_grant_referral(user_id, context):
 
     reward_amount = get_referral_reward()
 
-    # 3) ثبت اتمیک در جدول referrals
     with closing(get_db()) as db:
         try:
             db.execute("BEGIN IMMEDIATE")
@@ -632,7 +740,6 @@ async def try_grant_referral(user_id, context):
             logger.exception("Referral insert failed")
             return
 
-    # 4) واریز پاداش
     try:
         change_balance(
             referrer_id, reward_amount, "referral", f"Referral {user_id}"
@@ -641,7 +748,6 @@ async def try_grant_referral(user_id, context):
         logger.exception("Referral reward credit failed")
         return
 
-    # 5) اطلاع به معرف
     try:
         with closing(get_db()) as db:
             r = db.execute(
@@ -683,16 +789,15 @@ def is_game_chat(chat):
 
 
 # ============================================================
-# ✅ REPLY KEYBOARDS (کیبورد پایین صفحه)
+# REPLY KEYBOARDS
 # ============================================================
 
 def main_keyboard():
-    """کیبورد اصلی پایین صفحه"""
     return ReplyKeyboardMarkup(
         [
             ["💰 موجودی", "👥 زیرمجموعه"],
             ["🏧 برداشت TRX", "🆔 آیدی من"],
-            ["📱 اشتراک شماره", "📚 راهنما"],
+            ["📚 راهنما"],
         ],
         resize_keyboard=True,
         is_persistent=True,
@@ -700,14 +805,13 @@ def main_keyboard():
 
 
 def admin_reply_keyboard():
-    """کیبورد پنل مدیریت پایین صفحه"""
     status = "🟢 روشن" if bot_enabled() else "🔴 خاموش"
     reward = get_referral_reward()
     return ReplyKeyboardMarkup(
         [
             [f"📊 آمار ربات", status],
             ["➕ شارژ کاربر", "➖ کسر کاربر"],
-            ["🏧 برداشت‌های در انتظار", "📱 شماره‌های کاربران"],
+            ["🏧 برداشت‌های در انتظار"],
             ["💰 موجودی کاربران"],
             [
                 f"➖ کاهش پاداش ({money(reward)})",
@@ -718,18 +822,6 @@ def admin_reply_keyboard():
         resize_keyboard=True,
         is_persistent=True,
     )
-
-
-def phone_request_keyboard():
-    return ReplyKeyboardMarkup(
-        [[KeyboardButton("📱 ارسال شماره من", request_contact=True)]],
-        resize_keyboard=True,
-        one_time_keyboard=True,
-    )
-
-
-def cancel_withdraw_text():
-    return "برای لغو، کلمه: لغو"
 
 
 # ============================================================
@@ -767,7 +859,6 @@ async def start(update, context):
         return
     ensure_user(user)
 
-    # ---- REFERRAL: فقط ثبت معرف (پاداش بعد از شماره+عضویت پرداخت می‌شود) ----
     if context.args:
         arg = context.args[0]
         if arg.startswith("ref_"):
@@ -794,8 +885,8 @@ async def start(update, context):
                             """, (referrer_id, user.id))
                             db.commit()
 
-    if not is_owner(user.id) and not user_has_phone(user.id):
-        await send_phone_prompt(update, context)
+    if not is_owner(user.id) and not is_captcha_verified(user.id):
+        await send_captcha(update, context)
         return
 
     if not is_owner(user.id):
@@ -904,7 +995,6 @@ async def show_help(update, context, target=None):
         "💰 موجودی — نمایش موجودی\n"
         f"👥 زیرمجموعه — پاداش {money(reward)} {CURRENCY}\n"
         f"🏧 برداشت TRX — حداقل {money(MIN_WITHDRAWAL)} {CURRENCY}\n"
-        "📱 اشتراک شماره — فقط +98\n"
         "🆔 آیدی من — آیدی عددی شما\n\n"
         "🔄 انتقال در گپ:\n"
         "با ریپلای: <code>انتقال 0.5</code>\n"
@@ -927,131 +1017,6 @@ async def show_help(update, context, target=None):
             pass
     else:
         await update.message.reply_text(text, parse_mode="HTML")
-
-
-async def show_phone_request(update, context, target=None):
-    user = update.effective_user
-    ensure_user(user)
-    saved = get_user_phone(user.id)
-
-    if saved:
-        text = (
-            "📱 شماره شما ثبت شده است\n\n"
-            f"📞 <code>{safe_name(saved)}</code>\n\n"
-            "اگر می‌خواهید شماره دیگری ثبت کنید، روی دکمه زیر بزنید."
-        )
-    else:
-        text = (
-            "📱 اشتراک شماره\n\n"
-            "برای ثبت شماره، روی دکمه زیر بزنید.\n\n"
-            "⚠️ فقط شماره‌های با پیش‌شماره <b>+98</b> قبول می‌شوند."
-        )
-
-    if update.callback_query:
-        chat_id = update.callback_query.message.chat_id
-    elif target:
-        chat_id = target
-    else:
-        chat_id = update.effective_chat.id
-
-    await safe_send_message(
-        context.bot, chat_id, text, parse_mode="HTML"
-    )
-    await safe_send_message(
-        context.bot, chat_id,
-        "👇 برای ارسال شماره روی دکمه زیر بزنید:",
-        reply_markup=phone_request_keyboard()
-    )
-
-
-# ============================================================
-# CONTACT (phone)
-# ============================================================
-
-async def contact_handler(update, context):
-    message = update.message
-    user = update.effective_user
-
-    if not message or not user or not message.contact:
-        return
-    if message.chat.type != ChatType.PRIVATE:
-        return
-
-    contact = message.contact
-
-    if contact.user_id != user.id:
-        await message.reply_text(
-            "❌ فقط می‌توانید شماره‌ی خودتان را ارسال کنید.",
-            reply_markup=ReplyKeyboardRemove()
-        )
-        return
-
-    phone_raw = (contact.phone_number or "").strip()
-    phone_norm = normalize_digits(phone_raw)
-    phone_norm = (
-        phone_norm.replace(" ", "").replace("-", "")
-        .replace("(", "").replace(")", "")
-    )
-    if not phone_norm.startswith("+"):
-        phone_norm = "+" + phone_norm
-
-    if not is_valid_iran_phone(phone_norm):
-        await message.reply_text(
-            "❌ <b>شماره شما قبول نشد.</b>\n\n"
-            "فقط شماره‌های با پیش‌شماره <b>+98</b> پذیرفته می‌شوند.\n"
-            f"📞 شماره دریافتی: <code>{safe_name(phone_raw)}</code>\n\n"
-            "لطفاً با شماره ایران (+98) دوباره تلاش کنید.",
-            parse_mode="HTML",
-            reply_markup=phone_request_keyboard()
-        )
-        return
-
-    try:
-        with closing(get_db()) as db:
-            db.execute("""
-                INSERT INTO phone_numbers(user_id, phone)
-                VALUES (?, ?)
-                ON CONFLICT(user_id)
-                DO UPDATE SET phone = excluded.phone,
-                              created_at = CURRENT_TIMESTAMP
-            """, (user.id, phone_norm))
-            db.commit()
-    except Exception:
-        logger.exception("Save phone failed")
-        await message.reply_text(
-            "❌ خطا در ذخیره شماره.",
-            reply_markup=ReplyKeyboardRemove()
-        )
-        return
-
-    await message.reply_text(
-        "✅ <b>شماره شما با موفقیت ثبت شد.</b>\n\n"
-        f"📞 شماره: <code>{safe_name(phone_norm)}</code>",
-        parse_mode="HTML",
-        reply_markup=ReplyKeyboardRemove()
-    )
-
-    for owner in OWNER_IDS:
-        try:
-            await safe_send_message(
-                context.bot, owner,
-                "📱 <b>شماره جدید ثبت شد</b>\n\n"
-                f"👤 نام: {safe_name(user.first_name or '-')}\n"
-                f"🔗 یوزر: @{safe_name(user.username or '-')}\n"
-                f"🆔 آیدی: <code>{user.id}</code>\n"
-                f"📞 شماره: <code>{safe_name(phone_norm)}</code>",
-                parse_mode="HTML",
-            )
-        except Exception:
-            logger.exception("Notify owner phone failed")
-
-    if not is_owner(user.id):
-        if not await check_membership(user.id, context):
-            await send_join_required(update, context)
-            return
-        await try_grant_referral(user.id, context)
-
-    await send_start_menu(context, message.chat_id, user.id)
 
 
 # ============================================================
@@ -1479,7 +1444,6 @@ async def admin_panel(update, context):
 
 
 async def ask_admin_balance(update, context, operation):
-    """عملیات شارژ/کسر با فرمت آیدی و مبلغ"""
     user = update.effective_user
     context.user_data["admin_operation"] = operation
     context.user_data["admin_waiting"] = True
@@ -1649,7 +1613,9 @@ async def send_admin_stats(update, context):
         pending_wd = db.execute("""
             SELECT COUNT(*) AS c FROM withdrawals WHERE status = 'pending'
         """).fetchone()["c"]
-        phones = db.execute("SELECT COUNT(*) AS c FROM phone_numbers").fetchone()["c"]
+        verified = db.execute("""
+            SELECT COUNT(*) AS c FROM users WHERE captcha_verified = 1
+        """).fetchone()["c"]
 
     total = float(total_row["total"] or 0)
     reward = get_referral_reward()
@@ -1657,11 +1623,11 @@ async def send_admin_stats(update, context):
     await update.message.reply_text(
         "📊 <b>آمار BET_BT</b>\n\n"
         f"👤 کاربران: {users}\n"
+        f"✅ تأیید‌شده (کپچا): {verified}\n"
         f"💰 مجموع موجودی: {total:.4f} {CURRENCY}\n"
         f"👥 زیرمجموعه‌ها: {referrals}\n"
         f"🎁 پاداش زیرمجموعه: {money(reward)} {CURRENCY}\n"
         f"🎮 بازی‌ها: {games}\n"
-        f"📱 شماره‌ها: {phones}\n"
         f"🏧 برداشت در انتظار: {pending_wd}\n\n"
         f"وضعیت: {'🟢 روشن' if bot_enabled() else '🔴 خاموش'}",
         parse_mode="HTML",
@@ -1689,22 +1655,11 @@ async def send_admin_withdrawals(update, context):
         )
         return
 
-    lines = ["🏧 <b>برداشت‌های در انتظار:</b>\n"]
     for wd in rows:
         wd_id = wd["id"]
         wd_uid = wd["user_id"]
         amount = wd["amount"]
         wallet = wd["wallet"]
-        short_wallet = (
-            wallet if len(wallet) <= 30
-            else wallet[:15] + "..." + wallet[-10:]
-        )
-        lines.append(
-            f"🆔 {wd_id} | 👤 {wd_uid}\n"
-            f"💰 {amount} {CURRENCY}\n"
-            f"📮 <code>{safe_name(short_wallet)}</code>\n"
-        )
-        # ارسال کارت هر درخواست با دکمه
         await safe_send_message(
             context.bot, update.effective_chat.id,
             f"🏧 درخواست #{wd_id}\n"
@@ -1728,71 +1683,6 @@ async def send_admin_withdrawals(update, context):
         f"🏧 {len(rows)} درخواست در انتظار — به بالا اسکرول کنید.",
         reply_markup=admin_reply_keyboard()
     )
-
-
-async def send_admin_phones(update, context):
-    user = update.effective_user
-    if not is_owner(user.id):
-        return
-
-    with closing(get_db()) as db:
-        rows = db.execute("""
-            SELECT p.user_id, p.phone, p.created_at,
-                   u.first_name, u.username
-            FROM phone_numbers p
-            LEFT JOIN users u ON u.user_id = p.user_id
-            ORDER BY p.created_at DESC
-            LIMIT 50
-        """).fetchall()
-
-        total_row = db.execute(
-            "SELECT COUNT(*) AS c FROM phone_numbers"
-        ).fetchone()
-
-    total = total_row["c"] if total_row else 0
-
-    if not rows:
-        await update.message.reply_text(
-            f"📱 شماره‌های اشتراک‌گذاری‌شده\n\n❌ هنوز کسی شماره‌اش را ثبت نکرده.",
-            reply_markup=admin_reply_keyboard()
-        )
-        return
-
-    lines = [f"📱 <b>شماره‌های اشتراک‌گذاری‌شده ({total})</b>\n"]
-    for r in rows:
-        name = safe_name(r["first_name"] or "-")
-        uname = f"@{safe_name(r['username'])}" if r["username"] else "-"
-        lines.append(
-            f"👤 {name} | {uname}\n"
-            f"🆔 <code>{r['user_id']}</code>\n"
-            f"📞 <code>{safe_name(r['phone'])}</code>\n"
-            f"🕐 {r['created_at']}\n"
-        )
-
-    text = "\n".join(lines)
-
-    if len(text) <= 3800:
-        await update.message.reply_text(
-            text, parse_mode="HTML",
-            reply_markup=admin_reply_keyboard()
-        )
-    else:
-        chunk = ""
-        chunks = []
-        for line in lines:
-            if len(chunk) + len(line) + 1 > 3500:
-                chunks.append(chunk)
-                chunk = line + "\n"
-            else:
-                chunk += line + "\n"
-        if chunk:
-            chunks.append(chunk)
-        for i, ch in enumerate(chunks):
-            await safe_send_message(
-                context.bot, update.effective_chat.id, ch,
-                parse_mode="HTML",
-                reply_markup=admin_reply_keyboard() if i == len(chunks) - 1 else None
-            )
 
 
 async def send_admin_balances(update, context):
@@ -1834,7 +1724,6 @@ async def send_admin_balances(update, context):
         )
         return
 
-    # چانک اگر طولانی بود
     chunk = ""
     chunks = []
     for line in lines:
@@ -1855,7 +1744,7 @@ async def send_admin_balances(update, context):
 
 
 # ============================================================
-# WITHDRAW CALLBACK (تایید/رد - شیشه‌ای)
+# WITHDRAW CALLBACK
 # ============================================================
 
 async def withdraw_callback(update, context):
@@ -2175,7 +2064,7 @@ async def create_game(update, context, count, game_type, bet):
 
     ensure_user(user)
 
-    if not await require_phone_and_membership(update, context):
+    if not await require_captcha_and_membership(update, context):
         return
     if not bot_enabled():
         await update.message.reply_text("🔴 ربات خاموش است.")
@@ -2272,10 +2161,10 @@ async def join_game_callback(update, context):
     query = update.callback_query
     user = query.from_user
 
-    if not await require_phone_and_membership(update, context):
+    if not await require_captcha_and_membership(update, context):
         try:
             await query.answer(
-                "❌ ابتدا شماره ثبت و عضو کانال/گپ شوید.",
+                "❌ ابتدا تأیید امنیتی و عضویت را کامل کنید.",
                 show_alert=True
             )
         except Exception:
@@ -2382,9 +2271,9 @@ async def bot_game_callback(update, context):
     query = update.callback_query
     user = query.from_user
 
-    if not await require_phone_and_membership(update, context):
+    if not await require_captcha_and_membership(update, context):
         try:
-            await query.answer("❌ ابتدا شماره ثبت و عضو شوید.", show_alert=True)
+            await query.answer("❌ ابتدا تأیید امنیتی و عضویت.", show_alert=True)
         except Exception:
             pass
         return
@@ -3161,15 +3050,13 @@ async def text_handler(update, context):
 
     ensure_user(user)
 
-    if not await require_phone_and_membership(update, context):
+    if not await require_captcha_and_membership(update, context):
         return
 
     raw_text = message.text.strip()
     text = normalize_digits(raw_text).strip()
 
-    # ========================================================
-    # WITHDRAW FLOW (اول از همه)
-    # ========================================================
+    # WITHDRAW FLOW
     step = context.user_data.get("withdraw_step")
 
     if step == "amount":
@@ -3196,17 +3083,13 @@ async def text_handler(update, context):
         await handle_withdraw_wallet(update, context, text)
         return
 
-    # ========================================================
     # ADMIN INPUT (آیدی + مبلغ)
-    # ========================================================
     if is_owner(user.id):
         handled = await admin_balance_by_id(update, context)
         if handled:
             return
 
-    # ========================================================
     # ADMIN REPLY-BASED شارژ / کسر
-    # ========================================================
     if is_owner(user.id):
         m = re.match(r"^شارژ\s+([0-9]+(?:\.[0-9]+)?)$", text)
         if m:
@@ -3226,9 +3109,7 @@ async def text_handler(update, context):
             await admin_change_by_reply(update, context, "remove", amount)
             return
 
-    # ========================================================
-    # ✅ ADMIN REPLY BUTTONS
-    # ========================================================
+    # ADMIN REPLY BUTTONS
     if is_owner(user.id):
         if raw_text == "📊 آمار ربات" or raw_text == "📊 آمار":
             await send_admin_stats(update, context)
@@ -3255,9 +3136,6 @@ async def text_handler(update, context):
             return
         if raw_text == "🏧 برداشت‌های در انتظار":
             await send_admin_withdrawals(update, context)
-            return
-        if raw_text == "📱 شماره‌های کاربران":
-            await send_admin_phones(update, context)
             return
         if raw_text == "💰 موجودی کاربران":
             await send_admin_balances(update, context)
@@ -3286,9 +3164,7 @@ async def text_handler(update, context):
             )
             return
 
-    # ========================================================
-    # ✅ USER REPLY BUTTONS (کیبورد پایین)
-    # ========================================================
+    # USER REPLY BUTTONS
     if raw_text in ("💰 موجودی", "موجودی", "م", "موجودی من", "balance"):
         await show_balance(update, context)
         return
@@ -3301,16 +3177,11 @@ async def text_handler(update, context):
     if raw_text in ("🆔 آیدی من", "آیدی", "ایدی", "myid", "id"):
         await show_my_id(update, context)
         return
-    if raw_text in ("📱 اشتراک شماره", "اشتراک شماره", "شماره", "phone", "myphone"):
-        await show_phone_request(update, context)
-        return
     if raw_text in ("📚 راهنما", "راهنما", "کمک", "help"):
         await show_help(update, context)
         return
 
-    # ========================================================
     # TRANSFER
-    # ========================================================
     if text.startswith("انتقال"):
         match_id = re.match(
             r"^انتقال\s+([0-9]+(?:\.[0-9]+)?)\s+(\d{5,15})$", text
@@ -3344,9 +3215,7 @@ async def text_handler(update, context):
         )
         return
 
-    # ========================================================
     # GAME
-    # ========================================================
     game = parse_game(text)
 
     if game == "count_too_high":
@@ -3440,6 +3309,9 @@ def main():
         membership_callback, pattern=r"^check_membership$"
     ))
     application.add_handler(CallbackQueryHandler(
+        captcha_callback, pattern=r"^cap_\d+_\d+$"
+    ))
+    application.add_handler(CallbackQueryHandler(
         withdraw_callback, pattern=r"^wd_(ok|no)_\d+$"
     ))
     application.add_handler(CallbackQueryHandler(
@@ -3453,11 +3325,6 @@ def main():
     ))
     application.add_handler(CallbackQueryHandler(
         cancel_game_callback, pattern=r"^cancel_\d+$"
-    ))
-
-    application.add_handler(MessageHandler(
-        filters.CONTACT & filters.ChatType.PRIVATE,
-        contact_handler
     ))
 
     application.add_handler(MessageHandler(
