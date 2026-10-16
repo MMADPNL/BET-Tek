@@ -561,6 +561,8 @@ async def membership_callback(update, context):
             )
         except Exception:
             pass
+        if not is_owner(user.id):
+            await try_grant_referral(user.id, context)
         await send_start_menu(context, query.message.chat_id, user.id)
     else:
         try:
@@ -569,6 +571,103 @@ async def membership_callback(update, context):
             )
         except Exception:
             pass
+
+
+# ============================================================
+# REFERRAL GRANT (فقط بعد از شماره + عضویت)
+# ============================================================
+
+async def try_grant_referral(user_id, context):
+    """پاداش معرف را فقط زمانی می‌دهد که کاربر شماره داده و عضو کانال/گپ باشد."""
+    # 1) آیا کاربر معرف دارد و قبلاً پرداخت نشده؟
+    with closing(get_db()) as db:
+        user_row = db.execute(
+            "SELECT referrer_id FROM users WHERE user_id = ?", (user_id,)
+        ).fetchone()
+        if not user_row or user_row["referrer_id"] is None:
+            return
+        referrer_id = int(user_row["referrer_id"])
+
+        already = db.execute(
+            "SELECT id FROM referrals WHERE referred_id = ?", (user_id,)
+        ).fetchone()
+        if already:
+            return
+
+    # 2) شرط‌ها: شماره + عضویت
+    if not user_has_phone(user_id):
+        return
+    try:
+        if not await check_membership(user_id, context):
+            return
+    except Exception:
+        return
+
+    reward_amount = get_referral_reward()
+
+    # 3) ثبت اتمیک در جدول referrals
+    with closing(get_db()) as db:
+        try:
+            db.execute("BEGIN IMMEDIATE")
+            already = db.execute(
+                "SELECT id FROM referrals WHERE referred_id = ?", (user_id,)
+            ).fetchone()
+            if already:
+                db.rollback()
+                return
+            ref_exists = db.execute(
+                "SELECT user_id FROM users WHERE user_id = ?", (referrer_id,)
+            ).fetchone()
+            if not ref_exists:
+                db.rollback()
+                return
+
+            db.execute("""
+                INSERT INTO referrals(referrer_id, referred_id, reward)
+                VALUES (?, ?, ?)
+            """, (referrer_id, user_id, str(reward_amount)))
+            db.commit()
+        except Exception:
+            db.rollback()
+            logger.exception("Referral insert failed")
+            return
+
+    # 4) واریز پاداش
+    try:
+        change_balance(
+            referrer_id, reward_amount, "referral", f"Referral {user_id}"
+        )
+    except Exception:
+        logger.exception("Referral reward credit failed")
+        return
+
+    # 5) اطلاع به معرف
+    try:
+        with closing(get_db()) as db:
+            r = db.execute(
+                "SELECT first_name, username FROM users WHERE user_id = ?",
+                (user_id,)
+            ).fetchone()
+        if r and r["first_name"]:
+            ref_name = r["first_name"]
+        elif r and r["username"]:
+            ref_name = f"@{r['username']}"
+        else:
+            ref_name = str(user_id)
+        ref_name = safe_name(ref_name)
+
+        new_bal = get_balance(referrer_id)
+        await safe_send_message(
+            context.bot, referrer_id,
+            "🎁 <b>زیرمجموعه جدید!</b>\n\n"
+            f"👤 {ref_name} به زیرمجموعه‌های شما اضافه شد.\n\n"
+            f"💰 پاداش: <b>{money(reward_amount)} {CURRENCY}</b>\n"
+            f"💳 موجودی جدید: <b>{money(new_bal)} {CURRENCY}</b>",
+            parse_mode="HTML",
+            reply_markup=main_keyboard(),
+        )
+    except Exception:
+        logger.warning("Referral PV notify failed")
 
 
 # ============================================================
@@ -609,6 +708,7 @@ def admin_reply_keyboard():
             [f"📊 آمار ربات", status],
             ["➕ شارژ کاربر", "➖ کسر کاربر"],
             ["🏧 برداشت‌های در انتظار", "📱 شماره‌های کاربران"],
+            ["💰 موجودی کاربران"],
             [
                 f"➖ کاهش پاداش ({money(reward)})",
                 "➕ افزایش پاداش",
@@ -667,7 +767,7 @@ async def start(update, context):
         return
     ensure_user(user)
 
-    # ---- REFERRAL ----
+    # ---- REFERRAL: فقط ثبت معرف (پاداش بعد از شماره+عضویت پرداخت می‌شود) ----
     if context.args:
         arg = context.args[0]
         if arg.startswith("ref_"):
@@ -677,61 +777,22 @@ async def start(update, context):
                 referrer_id = None
 
             if referrer_id and referrer_id != user.id:
-                reward_amount = get_referral_reward()
-                reward_granted = False
-
                 with closing(get_db()) as db:
                     row = db.execute(
                         "SELECT referrer_id FROM users WHERE user_id = ?",
                         (user.id,)
                     ).fetchone()
-
                     if row and row["referrer_id"] is None:
-                        already = db.execute(
-                            "SELECT id FROM referrals WHERE referred_id = ?",
-                            (user.id,)
-                        ).fetchone()
                         ref_exists = db.execute(
                             "SELECT user_id FROM users WHERE user_id = ?",
                             (referrer_id,)
                         ).fetchone()
-
-                        if not already and ref_exists:
+                        if ref_exists:
                             db.execute("""
                                 UPDATE users SET referrer_id = ?
                                 WHERE user_id = ?
                             """, (referrer_id, user.id))
-                            db.execute("""
-                                INSERT INTO referrals(referrer_id, referred_id, reward)
-                                VALUES (?, ?, ?)
-                            """, (referrer_id, user.id, str(reward_amount)))
                             db.commit()
-                            reward_granted = True
-
-                if reward_granted:
-                    try:
-                        change_balance(
-                            referrer_id, reward_amount, "referral",
-                            f"Referral {user.id}"
-                        )
-                    except Exception:
-                        logger.exception("Referral reward failed")
-                    try:
-                        new_bal = get_balance(referrer_id)
-                        ref_name = safe_name(
-                            user.first_name
-                            or (f"@{user.username}" if user.username else str(user.id))
-                        )
-                        await safe_send_message(
-                            context.bot, referrer_id,
-                            "🎁 <b>زیرمجموعه جدید!</b>\n\n"
-                            f"👤 {ref_name} به زیرمجموعه‌های شما اضافه شد.\n\n"
-                            f"💰 پاداش: <b>{money(reward_amount)} {CURRENCY}</b>\n"
-                            f"💳 موجودی جدید: <b>{money(new_bal)} {CURRENCY}</b>",
-                            parse_mode="HTML",
-                        )
-                    except Exception:
-                        logger.warning("Referral PV notify failed")
 
     if not is_owner(user.id) and not user_has_phone(user.id):
         await send_phone_prompt(update, context)
@@ -741,6 +802,7 @@ async def start(update, context):
         if not await check_membership(user.id, context):
             await send_join_required(update, context)
             return
+        await try_grant_referral(user.id, context)
 
     await send_start_menu(context, update.effective_chat.id, user.id)
 
@@ -987,6 +1049,7 @@ async def contact_handler(update, context):
         if not await check_membership(user.id, context):
             await send_join_required(update, context)
             return
+        await try_grant_referral(user.id, context)
 
     await send_start_menu(context, message.chat_id, user.id)
 
@@ -1730,6 +1793,65 @@ async def send_admin_phones(update, context):
                 parse_mode="HTML",
                 reply_markup=admin_reply_keyboard() if i == len(chunks) - 1 else None
             )
+
+
+async def send_admin_balances(update, context):
+    user = update.effective_user
+    if not is_owner(user.id):
+        return
+
+    with closing(get_db()) as db:
+        rows = db.execute("""
+            SELECT user_id, username, first_name, balance
+            FROM users
+            ORDER BY CAST(balance AS REAL) DESC, user_id ASC
+        """).fetchall()
+
+    if not rows:
+        await update.message.reply_text(
+            "💰 موجودی کاربران\n\n❌ هنوز کاربری ثبت نشده.",
+            reply_markup=admin_reply_keyboard()
+        )
+        return
+
+    lines = [f"💰 <b>موجودی کاربران ({len(rows)})</b>\n"]
+    for i, r in enumerate(rows, 1):
+        if r["username"]:
+            name = f"@{r['username']}"
+        elif r["first_name"]:
+            name = r["first_name"]
+        else:
+            name = str(r["user_id"])
+        bal = money(Decimal(r["balance"]))
+        lines.append(f"{i}_ {safe_name(name)} <b>{bal}</b>")
+
+    text = "\n".join(lines)
+
+    if len(text) <= 3800:
+        await update.message.reply_text(
+            text, parse_mode="HTML",
+            reply_markup=admin_reply_keyboard()
+        )
+        return
+
+    # چانک اگر طولانی بود
+    chunk = ""
+    chunks = []
+    for line in lines:
+        if len(chunk) + len(line) + 1 > 3500:
+            chunks.append(chunk)
+            chunk = line + "\n"
+        else:
+            chunk += line + "\n"
+    if chunk:
+        chunks.append(chunk)
+
+    for i, ch in enumerate(chunks):
+        await safe_send_message(
+            context.bot, update.effective_chat.id, ch,
+            parse_mode="HTML",
+            reply_markup=admin_reply_keyboard() if i == len(chunks) - 1 else None
+        )
 
 
 # ============================================================
@@ -3136,6 +3258,9 @@ async def text_handler(update, context):
             return
         if raw_text == "📱 شماره‌های کاربران":
             await send_admin_phones(update, context)
+            return
+        if raw_text == "💰 موجودی کاربران":
+            await send_admin_balances(update, context)
             return
         if raw_text == "➕ افزایش پاداش":
             new_reward = get_referral_reward() + Decimal("0.01")
