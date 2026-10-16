@@ -63,6 +63,7 @@ GAME_TIMEOUT_MINUTES = 30
 PENDING_PROOF: dict = {}
 PENDING_CAPTCHA: dict = {}
 
+
 # ============================================================
 # LOGGING
 # ============================================================
@@ -157,7 +158,6 @@ def init_db():
             )
         """)
 
-        # migration: captcha_verified column
         user_columns = {
             row["name"]
             for row in db.execute("PRAGMA table_info(users)").fetchall()
@@ -240,7 +240,6 @@ def is_owner(user_id):
 
 
 def is_pv_chat_id(chat_id):
-    """آیدی چت‌های خصوصی همیشه مثبته، گروها منفی."""
     try:
         return int(chat_id) > 0
     except Exception:
@@ -410,6 +409,11 @@ def set_bot_enabled(enabled):
 # ============================================================
 
 async def safe_send_message(bot, chat_id, text, **kwargs):
+    # ⛔ کیبورد پایین صفحه در گپ/سوپرگپ ارسال نشه
+    rm = kwargs.get("reply_markup")
+    if isinstance(rm, ReplyKeyboardMarkup) and not is_pv_chat_id(chat_id):
+        kwargs.pop("reply_markup", None)
+
     for attempt in range(6):
         try:
             return await bot.send_message(chat_id=chat_id, text=text, **kwargs)
@@ -512,7 +516,6 @@ async def send_captcha(update, context):
     if not user:
         return
 
-    # ⛔ هرگز کپچا در گپ ارسال نشه
     chat = None
     if update.callback_query:
         chat = update.callback_query.message.chat
@@ -586,7 +589,6 @@ async def require_captcha_and_membership(update, context):
     if is_owner(user.id):
         return True
 
-    # توی گپ‌ها نه کپچا لازمه نه چک عضویت (کاربر اصلاً توی گپ هست)
     chat = update.effective_chat
     if update.callback_query:
         chat = update.callback_query.message.chat
@@ -834,7 +836,7 @@ def admin_reply_keyboard():
     reward = get_referral_reward()
     return ReplyKeyboardMarkup(
         [
-            [f"📊 آمار ربات", status],
+            ["📊 آمار ربات", status],
             ["➕ شارژ کاربر", "➖ کسر کاربر"],
             ["🏧 برداشت‌های در انتظار"],
             ["💰 موجودی کاربران"],
@@ -868,7 +870,6 @@ async def send_start_menu(context, chat_id, user_id):
         "📌 نتیجه بازی در گپ ارسال می‌شود."
     )
     kwargs = {"parse_mode": "HTML"}
-    # ⛔ کیبورد پیوی فقط توی پیوی
     if is_pv_chat_id(chat_id):
         kwargs["reply_markup"] = main_keyboard()
     await safe_send_message(context.bot, chat_id, text, **kwargs)
@@ -884,7 +885,6 @@ async def start(update, context):
         return
     ensure_user(user)
 
-    # referral ثبت
     if context.args:
         arg = context.args[0]
         if arg.startswith("ref_"):
@@ -911,7 +911,6 @@ async def start(update, context):
                             """, (referrer_id, user.id))
                             db.commit()
 
-    # ⛔ توی گپ هیچی نشون نده
     chat = update.effective_chat
     if chat and chat.type in (ChatType.GROUP, ChatType.SUPERGROUP):
         return
@@ -950,7 +949,10 @@ async def show_balance(update, context, target=None):
         except Exception:
             pass
     else:
-        await update.message.reply_text(text)
+        await update.message.reply_text(
+            text,
+            reply_to_message_id=update.message.message_id
+        )
 
 
 async def show_my_id(update, context, target=None):
@@ -973,7 +975,10 @@ async def show_my_id(update, context, target=None):
         except Exception:
             pass
     else:
-        await update.message.reply_text(text, parse_mode="HTML")
+        await update.message.reply_text(
+            text, parse_mode="HTML",
+            reply_to_message_id=update.message.message_id
+        )
 
 
 async def show_referral(update, context, target=None):
@@ -1015,7 +1020,10 @@ async def show_referral(update, context, target=None):
         except Exception:
             pass
     else:
-        await update.message.reply_text(text)
+        await update.message.reply_text(
+            text,
+            reply_to_message_id=update.message.message_id
+        )
 
 
 async def show_help(update, context, target=None):
@@ -1047,7 +1055,10 @@ async def show_help(update, context, target=None):
         except Exception:
             pass
     else:
-        await update.message.reply_text(text, parse_mode="HTML")
+        await update.message.reply_text(
+            text, parse_mode="HTML",
+            reply_to_message_id=update.message.message_id
+        )
 
 
 # ============================================================
@@ -1627,6 +1638,20 @@ async def admin_change_by_reply(update, context, operation, amount):
         f"💰 مبلغ: {money(amount)} {CURRENCY}\n"
         f"💳 موجودی جدید: {money(new_balance)} {CURRENCY}"
     )
+
+    # اطلاع به کاربر
+    try:
+        await safe_send_message(
+            context.bot, target.id,
+            f"💳 <b>موجودی شما تغییر کرد</b>\n\n"
+            f"{'➕' if operation == 'charge' else '➖'} مبلغ: "
+            f"<b>{money(amount)} {CURRENCY}</b>\n"
+            f"💰 موجودی جدید: <b>{money(new_balance)} {CURRENCY}</b>",
+            parse_mode="HTML",
+            reply_markup=main_keyboard()
+        )
+    except Exception:
+        pass
 
 
 async def send_admin_stats(update, context):
@@ -3086,138 +3111,142 @@ async def text_handler(update, context):
 
     raw_text = message.text.strip()
     text = normalize_digits(raw_text).strip()
-    is_pv = message.chat.type == ChatType.PRIVATE
 
     # ========================================================
-    # PV-ONLY: withdraw, admin input, admin buttons, user buttons
+    # WITHDRAW FLOW (پیوی)
     # ========================================================
-    if is_pv:
-        step = context.user_data.get("withdraw_step")
+    step = context.user_data.get("withdraw_step")
 
-        if step == "amount":
-            if text == "لغو" or raw_text == "لغو":
-                context.user_data.pop("withdraw_step", None)
-                context.user_data.pop("withdraw_amount", None)
-                await message.reply_text(
-                    "❌ برداشت لغو شد.",
-                    reply_markup=main_keyboard()
-                )
-                return
-            await handle_withdraw_amount(update, context, text)
+    if step == "amount":
+        if text == "لغو" or raw_text == "لغو":
+            context.user_data.pop("withdraw_step", None)
+            context.user_data.pop("withdraw_amount", None)
+            await message.reply_text(
+                "❌ برداشت لغو شد.",
+                reply_markup=main_keyboard()
+            )
             return
+        await handle_withdraw_amount(update, context, text)
+        return
 
-        if step == "wallet":
-            if text == "لغو" or raw_text == "لغو":
-                context.user_data.pop("withdraw_step", None)
-                context.user_data.pop("withdraw_amount", None)
-                await message.reply_text(
-                    "❌ برداشت لغو شد.",
-                    reply_markup=main_keyboard()
-                )
-                return
-            await handle_withdraw_wallet(update, context, text)
+    if step == "wallet":
+        if text == "لغو" or raw_text == "لغو":
+            context.user_data.pop("withdraw_step", None)
+            context.user_data.pop("withdraw_amount", None)
+            await message.reply_text(
+                "❌ برداشت لغو شد.",
+                reply_markup=main_keyboard()
+            )
             return
+        await handle_withdraw_wallet(update, context, text)
+        return
 
-        # ADMIN INPUT (آیدی + مبلغ)
-        if is_owner(user.id):
-            handled = await admin_balance_by_id(update, context)
-            if handled:
-                return
-
-        # ADMIN REPLY-BASED شارژ / کسر
-        if is_owner(user.id):
-            m = re.match(r"^شارژ\s+([0-9]+(?:\.[0-9]+)?)$", text)
-            if m:
-                amount = parse_amount(m.group(1))
-                if amount is None:
-                    await message.reply_text("❌ مبلغ صحیح نیست.")
-                    return
-                await admin_change_by_reply(update, context, "charge", amount)
-                return
-
-            m = re.match(r"^کسر\s+([0-9]+(?:\.[0-9]+)?)$", text)
-            if m:
-                amount = parse_amount(m.group(1))
-                if amount is None:
-                    await message.reply_text("❌ مبلغ صحیح نیست.")
-                    return
-                await admin_change_by_reply(update, context, "remove", amount)
-                return
-
-        # ADMIN REPLY BUTTONS
-        if is_owner(user.id):
-            if raw_text == "📊 آمار ربات" or raw_text == "📊 آمار":
-                await send_admin_stats(update, context)
-                return
-            if raw_text == "🟢 روشن":
-                set_bot_enabled(True)
-                await message.reply_text(
-                    "🟢 ربات روشن شد.",
-                    reply_markup=admin_reply_keyboard()
-                )
-                return
-            if raw_text == "🔴 خاموش":
-                set_bot_enabled(False)
-                await message.reply_text(
-                    "🔴 ربات خاموش شد.",
-                    reply_markup=admin_reply_keyboard()
-                )
-                return
-            if raw_text == "➕ شارژ کاربر" or raw_text == "➕ شارژ":
-                await ask_admin_balance(update, context, "charge")
-                return
-            if raw_text == "➖ کسر کاربر" or raw_text == "➖ کسر":
-                await ask_admin_balance(update, context, "remove")
-                return
-            if raw_text == "🏧 برداشت‌های در انتظار":
-                await send_admin_withdrawals(update, context)
-                return
-            if raw_text == "💰 موجودی کاربران":
-                await send_admin_balances(update, context)
-                return
-            if raw_text == "➕ افزایش پاداش":
-                new_reward = get_referral_reward() + Decimal("0.01")
-                set_referral_reward(new_reward)
-                await message.reply_text(
-                    f"✅ پاداش افزایش یافت: {money(new_reward)} {CURRENCY}",
-                    reply_markup=admin_reply_keyboard()
-                )
-                return
-            if raw_text.startswith("➖ کاهش پاداش"):
-                new_reward = get_referral_reward() - Decimal("0.01")
-                if new_reward < Decimal("0"):
-                    new_reward = Decimal("0")
-                set_referral_reward(new_reward)
-                await message.reply_text(
-                    f"✅ پاداش کاهش یافت: {money(new_reward)} {CURRENCY}",
-                    reply_markup=admin_reply_keyboard()
-                )
-                return
-            if raw_text == "🏠 منوی اصلی" or raw_text == "منوی اصلی":
-                await send_start_menu(
-                    context, message.chat.id, user.id
-                )
-                return
-
-        # USER REPLY BUTTONS
-        if raw_text in ("💰 موجودی", "موجودی", "م", "موجودی من", "balance"):
-            await show_balance(update, context)
-            return
-        if raw_text in ("👥 زیرمجموعه", "زیرمجموعه", "زیر مجموعه", "رفرال", "referral"):
-            await show_referral(update, context)
-            return
-        if raw_text in ("🏧 برداشت TRX", "برداشت"):
-            await show_withdraw_info(update, context)
-            return
-        if raw_text in ("🆔 آیدی من", "آیدی", "ایدی", "myid", "id"):
-            await show_my_id(update, context)
-            return
-        if raw_text in ("📚 راهنما", "راهنما", "کمک", "help"):
-            await show_help(update, context)
+    # ========================================================
+    # ADMIN INPUT (آیدی + مبلغ)
+    # ========================================================
+    if is_owner(user.id):
+        handled = await admin_balance_by_id(update, context)
+        if handled:
             return
 
     # ========================================================
-    # TRANSFER (هم پیوی هم گپ)
+    # ADMIN REPLY-BASED شارژ / کسر
+    # ========================================================
+    if is_owner(user.id):
+        m = re.match(r"^شارژ\s+([0-9]+(?:\.[0-9]+)?)$", text)
+        if m:
+            amount = parse_amount(m.group(1))
+            if amount is None:
+                await message.reply_text("❌ مبلغ صحیح نیست.")
+                return
+            await admin_change_by_reply(update, context, "charge", amount)
+            return
+
+        m = re.match(r"^کسر\s+([0-9]+(?:\.[0-9]+)?)$", text)
+        if m:
+            amount = parse_amount(m.group(1))
+            if amount is None:
+                await message.reply_text("❌ مبلغ صحیح نیست.")
+                return
+            await admin_change_by_reply(update, context, "remove", amount)
+            return
+
+    # ========================================================
+    # ADMIN REPLY BUTTONS
+    # ========================================================
+    if is_owner(user.id):
+        if raw_text == "📊 آمار ربات" or raw_text == "📊 آمار":
+            await send_admin_stats(update, context)
+            return
+        if raw_text == "🟢 روشن":
+            set_bot_enabled(True)
+            await message.reply_text(
+                "🟢 ربات روشن شد.",
+                reply_markup=admin_reply_keyboard()
+            )
+            return
+        if raw_text == "🔴 خاموش":
+            set_bot_enabled(False)
+            await message.reply_text(
+                "🔴 ربات خاموش شد.",
+                reply_markup=admin_reply_keyboard()
+            )
+            return
+        if raw_text == "➕ شارژ کاربر" or raw_text == "➕ شارژ":
+            await ask_admin_balance(update, context, "charge")
+            return
+        if raw_text == "➖ کسر کاربر" or raw_text == "➖ کسر":
+            await ask_admin_balance(update, context, "remove")
+            return
+        if raw_text == "🏧 برداشت‌های در انتظار":
+            await send_admin_withdrawals(update, context)
+            return
+        if raw_text == "💰 موجودی کاربران":
+            await send_admin_balances(update, context)
+            return
+        if raw_text == "➕ افزایش پاداش":
+            new_reward = get_referral_reward() + Decimal("0.01")
+            set_referral_reward(new_reward)
+            await message.reply_text(
+                f"✅ پاداش افزایش یافت: {money(new_reward)} {CURRENCY}",
+                reply_markup=admin_reply_keyboard()
+            )
+            return
+        if raw_text.startswith("➖ کاهش پاداش"):
+            new_reward = get_referral_reward() - Decimal("0.01")
+            if new_reward < Decimal("0"):
+                new_reward = Decimal("0")
+            set_referral_reward(new_reward)
+            await message.reply_text(
+                f"✅ پاداش کاهش یافت: {money(new_reward)} {CURRENCY}",
+                reply_markup=admin_reply_keyboard()
+            )
+            return
+        if raw_text == "🏠 منوی اصلی" or raw_text == "منوی اصلی":
+            await send_start_menu(context, message.chat.id, user.id)
+            return
+
+    # ========================================================
+    # USER REPLY BUTTONS (پیوی + گپ)
+    # ========================================================
+    if raw_text in ("💰 موجودی", "موجودی", "م", "موجودی من", "balance"):
+        await show_balance(update, context)
+        return
+    if raw_text in ("👥 زیرمجموعه", "زیرمجموعه", "زیر مجموعه", "رفرال", "referral"):
+        await show_referral(update, context)
+        return
+    if raw_text in ("🏧 برداشت TRX", "برداشت"):
+        await show_withdraw_info(update, context)
+        return
+    if raw_text in ("🆔 آیدی من", "آیدی", "ایدی", "myid", "id"):
+        await show_my_id(update, context)
+        return
+    if raw_text in ("📚 راهنما", "راهنما", "کمک", "help"):
+        await show_help(update, context)
+        return
+
+    # ========================================================
+    # TRANSFER
     # ========================================================
     if text.startswith("انتقال"):
         match_id = re.match(
@@ -3389,7 +3418,7 @@ def main():
     application.add_error_handler(error_handler)
 
     if application.job_queue:
-        application.job_queue.run_repeating(
+        application.job_queue.run_repeated(
             cleanup_job, interval=300, first=60
         )
 
