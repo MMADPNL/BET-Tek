@@ -865,7 +865,7 @@ async def send_start_menu(context, chat_id, user_id):
         f"{GROUP_URL}\n\n"
         "مثال: <code>3 تاس 0.5</code>\n"
         f"• حداقل شرط: {money(MIN_GAME_BET)} {CURRENCY}\n"
-        f"• حداکثر شرط: بدون سقف\n"
+        "• حداکثر شرط: بدون سقف\n"
         f"• حداکثر پرتاب: {MAX_GAME_COUNT}\n\n"
         "📌 نتیجه بازی در گپ ارسال می‌شود."
     )
@@ -949,10 +949,10 @@ async def show_balance(update, context, target=None):
         except Exception:
             pass
     else:
-        await update.message.reply_text(
-            text,
-            reply_to_message_id=update.message.message_id
-        )
+        kwargs = {"reply_to_message_id": update.message.message_id}
+        if update.message.chat.type != ChatType.PRIVATE:
+            kwargs["reply_markup"] = ReplyKeyboardRemove()
+        await update.message.reply_text(text, **kwargs)
 
 
 async def show_my_id(update, context, target=None):
@@ -975,10 +975,10 @@ async def show_my_id(update, context, target=None):
         except Exception:
             pass
     else:
-        await update.message.reply_text(
-            text, parse_mode="HTML",
-            reply_to_message_id=update.message.message_id
-        )
+        kwargs = {"reply_to_message_id": update.message.message_id, "parse_mode": "HTML"}
+        if update.message.chat.type != ChatType.PRIVATE:
+            kwargs["reply_markup"] = ReplyKeyboardRemove()
+        await update.message.reply_text(text, **kwargs)
 
 
 async def show_referral(update, context, target=None):
@@ -1020,10 +1020,10 @@ async def show_referral(update, context, target=None):
         except Exception:
             pass
     else:
-        await update.message.reply_text(
-            text,
-            reply_to_message_id=update.message.message_id
-        )
+        kwargs = {"reply_to_message_id": update.message.message_id}
+        if update.message.chat.type != ChatType.PRIVATE:
+            kwargs["reply_markup"] = ReplyKeyboardRemove()
+        await update.message.reply_text(text, **kwargs)
 
 
 async def show_help(update, context, target=None):
@@ -1042,7 +1042,7 @@ async def show_help(update, context, target=None):
         "فرمت: <code>تعداد نوع شرط</code>\n"
         "مثال: <code>3 تاس 0.5</code>\n\n"
         f"• حداقل شرط: {money(MIN_GAME_BET)} {CURRENCY}\n"
-        f"• حداکثر شرط: بدون سقف\n"
+        "• حداکثر شرط: بدون سقف\n"
         f"• حداکثر تعداد پرتاب: {MAX_GAME_COUNT}\n\n"
         "انواع بازی:\n"
         "🎲 تاس\n🎯 دارت\n🎳 بولینگ\n🏀 بسکتبال"
@@ -1055,10 +1055,10 @@ async def show_help(update, context, target=None):
         except Exception:
             pass
     else:
-        await update.message.reply_text(
-            text, parse_mode="HTML",
-            reply_to_message_id=update.message.message_id
-        )
+        kwargs = {"reply_to_message_id": update.message.message_id, "parse_mode": "HTML"}
+        if update.message.chat.type != ChatType.PRIVATE:
+            kwargs["reply_markup"] = ReplyKeyboardRemove()
+        await update.message.reply_text(text, **kwargs)
 
 
 # ============================================================
@@ -1492,6 +1492,10 @@ async def ask_admin_balance(update, context, operation):
 
     title = "➕ شارژ موجودی" if operation == "charge" else "➖ کسر موجودی"
 
+    kwargs = {"parse_mode": "HTML"}
+    if update.message.chat.type != ChatType.PRIVATE:
+        kwargs["reply_markup"] = ReplyKeyboardRemove()
+
     await update.message.reply_text(
         f"{title}\n\n"
         "فرمت ارسال:\n"
@@ -1499,7 +1503,7 @@ async def ask_admin_balance(update, context, operation):
         "مثال:\n"
         "<code>8935601841 100</code>\n\n"
         "برای لغو: <code>لغو</code>",
-        parse_mode="HTML"
+        **kwargs
     )
 
 
@@ -1518,9 +1522,14 @@ async def admin_balance_by_id(update, context):
     if text == "لغو":
         context.user_data.pop("admin_operation", None)
         context.user_data.pop("admin_waiting", None)
+        
+        kwargs = {"reply_markup": admin_reply_keyboard()}
+        if update.message.chat.type != ChatType.PRIVATE:
+            kwargs["reply_markup"] = ReplyKeyboardRemove()
+
         await update.message.reply_text(
             "❌ عملیات لغو شد.",
-            reply_markup=admin_reply_keyboard()
+            **kwargs
         )
         return True
 
@@ -1561,9 +1570,12 @@ async def admin_balance_by_id(update, context):
             title = "کسر"
     except ValueError as e:
         if str(e) == "insufficient_balance":
+            kwargs = {"reply_markup": admin_reply_keyboard()}
+            if update.message.chat.type != ChatType.PRIVATE:
+                kwargs["reply_markup"] = ReplyKeyboardRemove()
             await update.message.reply_text(
                 "❌ موجودی کاربر برای کسر کافی نیست.",
-                reply_markup=admin_reply_keyboard()
+                **kwargs
             )
         else:
             await update.message.reply_text("❌ عملیات انجام نشد.")
@@ -1573,12 +1585,16 @@ async def admin_balance_by_id(update, context):
         await update.message.reply_text("❌ خطا در تغییر موجودی.")
         return True
 
+    kwargs = {"reply_markup": admin_reply_keyboard()}
+    if update.message.chat.type != ChatType.PRIVATE:
+        kwargs["reply_markup"] = ReplyKeyboardRemove()
+
     await update.message.reply_text(
         f"✅ {title} انجام شد.\n\n"
         f"🆔 آیدی: {target_id}\n"
         f"💰 مبلغ: {money(amount)} {CURRENCY}\n"
         f"💳 موجودی جدید: {money(new_balance)} {CURRENCY}",
-        reply_markup=admin_reply_keyboard()
+        **kwargs
     )
     return True
 
@@ -1631,12 +1647,17 @@ async def admin_change_by_reply(update, context, operation, amount):
         await message.reply_text("❌ عملیات انجام نشد.")
         return
 
+    kwargs = {}
+    if message.chat.type != ChatType.PRIVATE:
+        kwargs["reply_markup"] = ReplyKeyboardRemove()
+
     await message.reply_text(
         f"✅ {title} انجام شد.\n\n"
         f"👤 کاربر: {safe_name(target.first_name or target.id)}\n"
         f"🆔 آیدی: {target.id}\n"
         f"💰 مبلغ: {money(amount)} {CURRENCY}\n"
-        f"💳 موجودی جدید: {money(new_balance)} {CURRENCY}"
+        f"💳 موجودی جدید: {money(new_balance)} {CURRENCY}",
+        **kwargs
     )
 
     # اطلاع به کاربر
@@ -3142,7 +3163,7 @@ async def text_handler(update, context):
         return
 
     # ========================================================
-    # ADMIN INPUT (آیدی + مبلغ)
+    # ADMIN INPUT (آیدی + مبلغ) - کار در پیوی و گپ
     # ========================================================
     if is_owner(user.id):
         handled = await admin_balance_by_id(update, context)
@@ -3150,7 +3171,7 @@ async def text_handler(update, context):
             return
 
     # ========================================================
-    # ADMIN REPLY-BASED شارژ / کسر
+    # ADMIN REPLY-BASED شارژ / کسر - کار در پیوی و گپ
     # ========================================================
     if is_owner(user.id):
         m = re.match(r"^شارژ\s+([0-9]+(?:\.[0-9]+)?)$", text)
@@ -3172,9 +3193,9 @@ async def text_handler(update, context):
             return
 
     # ========================================================
-    # ADMIN REPLY BUTTONS
+    # ADMIN BUTTONS (فقط پیوی)
     # ========================================================
-    if is_owner(user.id):
+    if is_owner(user.id) and message.chat.type == ChatType.PRIVATE:
         if raw_text == "📊 آمار ربات" or raw_text == "📊 آمار":
             await send_admin_stats(update, context)
             return
@@ -3227,7 +3248,24 @@ async def text_handler(update, context):
             return
 
     # ========================================================
-    # USER REPLY BUTTONS (پیوی + گپ)
+    # اگر مالک دکمه‌های ادمین رو توی گپ زد، کیبورد پاک شه
+    # ========================================================
+    if is_owner(user.id) and message.chat.type != ChatType.PRIVATE:
+        admin_buttons = [
+            "📊 آمار ربات", "📊 آمار", "🟢 روشن", "🔴 خاموش",
+            "➕ شارژ کاربر", "➕ شارژ", "➖ کسر کاربر", "➖ کسر",
+            "🏧 برداشت‌های در انتظار", "💰 موجودی کاربران",
+            "➕ افزایش پاداش", "🏠 منوی اصلی"
+        ]
+        if raw_text in admin_buttons or raw_text.startswith("➖ کاهش پاداش"):
+            await message.reply_text(
+                "❌ پنل مدیریت فقط در پیوی کار می‌کند.",
+                reply_markup=ReplyKeyboardRemove()
+            )
+            return
+
+    # ========================================================
+    # USER BUTTONS (پیوی + گپ)
     # ========================================================
     if raw_text in ("💰 موجودی", "موجودی", "م", "موجودی من", "balance"):
         await show_balance(update, context)
@@ -3418,7 +3456,7 @@ def main():
     application.add_error_handler(error_handler)
 
     if application.job_queue:
-        application.job_queue.run_repeated(
+        application.job_queue.run_repeating(
             cleanup_job, interval=300, first=60
         )
 
